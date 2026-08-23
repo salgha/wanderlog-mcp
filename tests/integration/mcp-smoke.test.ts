@@ -133,6 +133,23 @@ describe("MCP stdio server (smoke)", () => {
       "wanderlog_update_section",
       "wanderlog_update_trip_dates",
     ]);
+
+    const tools = resp.result.tools as Array<{
+      name: string;
+      inputSchema: { properties?: Record<string, unknown> };
+    }>;
+    for (const name of [
+      "wanderlog_add_place",
+      "wanderlog_add_note",
+      "wanderlog_add_checklist",
+      "wanderlog_edit_note",
+      "wanderlog_remove_note",
+      "wanderlog_annotate_place",
+    ]) {
+      const tool = tools.find((candidate) => candidate.name === name);
+      expect(tool?.inputSchema.properties).toHaveProperty("section");
+      expect(tool?.inputSchema.properties).toHaveProperty("day");
+    }
   });
 
   it("invokes wanderlog_list_trips successfully", async () => {

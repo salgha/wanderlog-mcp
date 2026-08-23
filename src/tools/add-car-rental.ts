@@ -4,10 +4,10 @@ import { WanderlogError } from "../errors.js";
 import type { RentalCarEndpoint } from "../types.js";
 import {
   buildRentalCarBlock,
+  buildAndSubmitOp,
   requireUserId,
   resolveEndpointPlace,
   sectionInsertOp,
-  submitOp,
   validateChronology,
 } from "./shared.js";
 
@@ -99,10 +99,12 @@ export async function addCarRental(
       notes: args.notes,
     });
 
-    const op = sectionInsertOp(trip, "rentalCars", block);
-    await submitOp(ctx, args.trip_key, [op]);
+    const title = await buildAndSubmitOp(ctx, args.trip_key, (currentTrip) => ({
+      ops: [sectionInsertOp(currentTrip, "rentalCars", block)],
+      result: currentTrip.title,
+    }));
 
-    const text = `Added rental car to "${trip.title}" · pick-up ${pickPlace.name} ${args.pickup_date} ${args.pickup_time} → drop-off ${dropPlace.name} ${args.dropoff_date} ${args.dropoff_time}.`;
+    const text = `Added rental car to "${title}" · pick-up ${pickPlace.name} ${args.pickup_date} ${args.pickup_time} → drop-off ${dropPlace.name} ${args.dropoff_date} ${args.dropoff_time}.`;
     return { content: [{ type: "text", text }] };
   } catch (err) {
     const msg =

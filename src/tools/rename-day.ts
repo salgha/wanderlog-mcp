@@ -3,7 +3,7 @@ import type { AppContext } from "../context.js";
 import { WanderlogError, WanderlogValidationError } from "../errors.js";
 import type { Json0Op } from "../ot/apply.js";
 import { resolveDay } from "../resolvers/day.js";
-import { findDaySectionByDate, submitOp } from "./shared.js";
+import { buildAndSubmitOp, findDaySectionByDate } from "./shared.js";
 
 export const renameDayInputSchema = {
   trip_key: z.string().min(1).describe("The trip containing the day to rename."),
@@ -40,42 +40,47 @@ export async function renameDay(
   args: Args,
 ): Promise<{ content: Array<{ type: "text"; text: string }>; isError?: boolean }> {
   try {
-    const entry = await ctx.tripCache.getEntry(args.trip_key);
-    const trip = entry.snapshot;
+    const result = await buildAndSubmitOp(ctx, args.trip_key, (trip) => {
+      const daySection = resolveDay(trip, args.day);
+      const found = findDaySectionByDate(trip, daySection.date!);
+      if (!found) {
+        throw new WanderlogValidationError(`Day ${args.day} not found in trip`);
+      }
+      const oldHeading = found.section.heading;
+      const newHeading = args.heading;
+      const ops: Json0Op[] = oldHeading === newHeading
+        ? []
+        : [{
+            p: ["itinerary", "sections", found.index, "heading"],
+            od: oldHeading,
+            oi: newHeading,
+          }];
+      return {
+        ops,
+        result: {
+          changed: ops.length > 0,
+          date: daySection.date!,
+          oldHeading,
+          newHeading,
+          title: trip.title,
+        },
+      };
+    });
 
-    const daySection = resolveDay(trip, args.day);
-    const found = findDaySectionByDate(trip, daySection.date!);
-    if (!found) {
-      throw new WanderlogValidationError(`Day ${args.day} not found in trip`);
-    }
-
-    const oldHeading = found.section.heading;
-    const newHeading = args.heading;
-
-    if (oldHeading === newHeading) {
+    if (!result.changed) {
       return {
         content: [
           {
             type: "text",
-            text: `Day ${daySection.date} heading is already "${newHeading}" — no change made.`,
+            text: `Day ${result.date} heading is already "${result.newHeading}" — no change made.`,
           },
         ],
       };
     }
 
-    const ops: Json0Op[] = [
-      {
-        p: ["itinerary", "sections", found.index, "heading"],
-        od: oldHeading,
-        oi: newHeading,
-      },
-    ];
-
-    await submitOp(ctx, args.trip_key, ops);
-
-    const oldLabel = oldHeading || "(auto-generated)";
-    const newLabel = newHeading || "(auto-generated)";
-    const text = `Renamed day ${daySection.date} in "${trip.title}": "${oldLabel}" → "${newLabel}"`;
+    const oldLabel = result.oldHeading || "(auto-generated)";
+    const newLabel = result.newHeading || "(auto-generated)";
+    const text = `Renamed day ${result.date} in "${result.title}": "${oldLabel}" → "${newLabel}"`;
     return { content: [{ type: "text", text }] };
   } catch (err) {
     const msg =

@@ -1,48 +1,40 @@
 import { z } from "zod";
 import type { AppContext } from "../context.js";
-import { WanderlogError, WanderlogValidationError } from "../errors.js";
+import { WanderlogError } from "../errors.js";
 import type { Json0Op } from "../ot/apply.js";
 import {
+  assertHeadingAvailable,
   buildSectionObject,
-  findSectionByRef,
-  requireUserId,
-  submitOp,
-} from "./shared.js";
+  requireNonEmptyHeading,
+  requireSectionRef,
+} from "./section-shared.js";
+import { buildAndSubmitOp } from "./shared.js";
 
 export const addSectionInputSchema = {
-  trip_key: z
-    .string()
-    .min(1)
-    .describe("The trip to add the section to. Use wanderlog_list_trips if you don't know the key."),
+  trip_key: z.string().min(1).describe("The trip to add the section to."),
   heading: z
     .string()
-    .optional()
-    .describe(
-      "Heading for the new section (e.g. 'Food & Drink', 'Must-See Spots'). Omit for an untitled section.",
-    ),
+    .trim()
+    .min(1)
+    .describe("A distinct, non-empty heading for the new custom section."),
   after_section: z
     .string()
+    .trim()
+    .min(1)
     .optional()
-    .describe(
-      "Insert the new section immediately after an existing section identified by its heading (e.g. 'Places to visit', 'Food & Drink'). Omit to append at the end of the trip.",
-    ),
+    .describe("Optional existing section after which to insert the new section. Supports ordinal references for duplicate headings."),
 };
 
 export const addSectionDescription = `
-Adds a new custom section to a Wanderlog trip itinerary. Sections are containers for places,
-notes, and other blocks — use them to group content thematically (e.g. "Food & Drink",
-"Day Trips", "Must-See Spots") or to create additional place lists beyond the default
-"Places to visit".
-
-The new section is empty; add places to it with wanderlog_add_place by passing the section
-heading as the "section" parameter, or use wanderlog_add_note / wanderlog_add_checklist.
-
-Returns the heading and position of the inserted section.
+Adds an empty custom place-list section to a Wanderlog trip. The heading must be non-empty and
+must not duplicate another section heading. Omit after_section to append it at the end, or name
+an existing section to insert it immediately afterward. Add places later with
+wanderlog_add_place using its section parameter.
 `.trim();
 
 type Args = {
   trip_key: string;
-  heading?: string;
+  heading: string;
   after_section?: string;
 };
 
@@ -51,42 +43,31 @@ export async function addSection(
   args: Args,
 ): Promise<{ content: Array<{ type: "text"; text: string }>; isError?: boolean }> {
   try {
-    requireUserId(ctx);
-    const entry = await ctx.tripCache.getEntry(args.trip_key);
-    const trip = entry.snapshot;
-
-    let insertIndex: number;
-    if (args.after_section) {
-      const found = findSectionByRef(trip, args.after_section);
-      if (!found) {
-        throw new WanderlogValidationError(
-          `Section "${args.after_section}" not found in trip "${trip.title}". Use wanderlog_get_trip to see available sections.`,
-        );
+    const heading = requireNonEmptyHeading(args.heading);
+    const result = await buildAndSubmitOp(ctx, args.trip_key, (trip) => {
+      assertHeadingAvailable(trip, heading);
+      let insertIndex = trip.itinerary.sections.length;
+      let position = "at the end";
+      if (args.after_section) {
+        const after = requireSectionRef(trip, args.after_section);
+        insertIndex = after.index + 1;
+        position = `after "${after.section.heading || args.after_section}"`;
       }
-      insertIndex = found.index + 1;
-    } else {
-      insertIndex = trip.itinerary.sections.length;
-    }
+      const section = buildSectionObject(heading);
+      const ops: Json0Op[] = [{ p: ["itinerary", "sections", insertIndex], li: section }];
+      return { ops, result: { position, title: trip.title } };
+    });
 
-    const heading = args.heading ?? "";
-    const section = buildSectionObject(heading);
-
-    const ops: Json0Op[] = [
-      { p: ["itinerary", "sections", insertIndex], li: section },
-    ];
-    await submitOp(ctx, args.trip_key, ops);
-
-    const headingLabel = heading || "(untitled)";
-    const positionLabel = args.after_section
-      ? `after "${args.after_section}"`
-      : "at the end";
-    const text = `Added section "${headingLabel}" ${positionLabel} in "${trip.title}".`;
-    return { content: [{ type: "text", text }] };
+    return {
+      content: [{
+        type: "text",
+        text: `Added custom section "${heading}" ${result.position} in "${result.title}".`,
+      }],
+    };
   } catch (err) {
-    const msg =
-      err instanceof WanderlogError
-        ? err.toUserMessage()
-        : `Unexpected error: ${(err as Error).message}`;
-    return { content: [{ type: "text", text: msg }], isError: true };
+    const text = err instanceof WanderlogError
+      ? err.toUserMessage()
+      : `Unexpected error: ${(err as Error).message}`;
+    return { content: [{ type: "text", text }], isError: true };
   }
 }

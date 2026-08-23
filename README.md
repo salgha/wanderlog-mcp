@@ -16,10 +16,21 @@ The agent calls the tools, interleaves places and notes for each day, adds hotel
 
 **See a real example:** [14-day Japan Golden Route](https://wanderlog.com/view/dmvegdhqsa/japan-golden-route--tokyo--hakone--kyoto--nara--osaka) — built entirely by an AI agent using this MCP server.
 
-## What's New (Unreleased)
+## What's New in v0.4.0
 
 - `wanderlog_search_hotels` — search Wanderlog's hotel aggregator across airbnb, expedia, google, and kayak. Returns ranked offers with per-vendor price comparison and faceted filter discovery so the LLM never has to memorise Wanderlog's internal enum values.
 - A failed startup authentication probe now gets one shared retry on the first tool call, allowing valid sessions to recover from a transient network or proxy error without restarting the server.
+- Named custom sections can be created, renamed, deleted, and used as destinations/scopes for places, notes, checklists, and annotations. Duplicate headings use ordinal references such as `2nd Food` or `last Food`.
+- Mutation construction now runs against the freshest cached snapshot inside the per-trip submit lock, and cache state is discarded and freshly resubscribed when a remote ShareDB op races a local submit.
+- Section/day targeting and heading validation are intentionally stricter; see the migration notes below.
+
+### Migrating from v0.3.x
+
+These are intentional breaking contract changes:
+
+- Calls that previously supplied both `day` and `section` must now choose exactly one. Omit both to keep using the default “Places to visit” destination where the tool supports it.
+- `wanderlog_add_section` and `wanderlog_update_section` no longer accept empty or whitespace-only new headings. Supply a non-empty custom heading.
+- `wanderlog_update_section` no longer accepts an empty or whitespace-only replacement heading. `wanderlog_rename_day` is unchanged and still supports its existing empty-heading reset behavior.
 
 ## What's New in v0.3.1
 
@@ -94,22 +105,25 @@ and a ryokan in Shinjuku."
 | `wanderlog_get_guide` | Read the full content of a public Wanderlog guide (sections, places, notes) |
 | `wanderlog_search_hotels` | Search Wanderlog's hotel aggregator (airbnb/expedia/google/kayak) with per-vendor deal comparison |
 | `wanderlog_create_trip` | Create a new trip with destination + date range |
-| `wanderlog_add_place` | Add a place to a specific day or general list |
-| `wanderlog_add_note` | Add a note (transit tips, booking info, local advice) |
-| `wanderlog_edit_note` | Find-and-replace text in notes, place annotations, and checklists |
-| `wanderlog_remove_note` | Remove a standalone note block by natural-language reference |
+| `wanderlog_add_place` | Add a place to a day, named custom place-list section, or the general list |
+| `wanderlog_add_note` | Add a note to a day, named section, or the general list |
+| `wanderlog_edit_note` | Find-and-replace text in notes, place annotations, and checklists, optionally scoped to a day or section |
+| `wanderlog_remove_note` | Remove a standalone note block, optionally scoped to a day or section |
 | `wanderlog_add_hotel` | Add a hotel booking with check-in/check-out dates |
 | `wanderlog_add_transit` | Add a ferry, bus, or train leg (carrier, from/to, dates/times) to the shared Transit section |
 | `wanderlog_add_car_rental` | Add a rental car with pick-up/drop-off locations and times |
-| `wanderlog_add_checklist` | Add a pre-trip or per-day checklist |
+| `wanderlog_add_checklist` | Add a checklist to a day, named section, or the general list |
 | `wanderlog_add_expense` | Log a budget expense (amount, category, currency), optionally linked to a place |
 | `wanderlog_list_expenses` | List budget expenses, optionally filtered by description / date / amount / currency |
 | `wanderlog_remove_expense` | Remove a budget expense by description (with optional date / amount / currency filters) |
 | `wanderlog_edit_expense` | Change a budget expense's description, amount, currency, category, or date |
-| `wanderlog_annotate_place` | Update an existing place with a note, start/end time, or both |
+| `wanderlog_annotate_place` | Update an existing place with a note/times, optionally scoped to a day or section |
 | `wanderlog_remove_place` | Remove a place by natural-language reference |
 | `wanderlog_update_trip_dates` | Change a trip's date range |
 | `wanderlog_rename_day` | Rename a day's heading (e.g. `"Barcelona"` → `"Arrival — Feria de Abril"`) |
+| `wanderlog_add_section` | Add a distinct named custom place-list section |
+| `wanderlog_update_section` | Rename a mutable custom place-list section |
+| `wanderlog_delete_section` | Permanently delete a mutable custom place-list section and its blocks |
 | `wanderlog_list_journal` | List journal (travelogue) stops, optionally filtered by title or date |
 | `wanderlog_add_journal` | Add a journal stop: a place + date/time + text entry |
 | `wanderlog_edit_journal` | Edit a journal stop's title, text, or date/time (or the journal summary) |

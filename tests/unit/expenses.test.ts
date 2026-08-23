@@ -36,6 +36,7 @@ function makeFakeContext(trip: TripPlan): {
     },
     tripCache: {
       get: async () => structuredClone(trip),
+      getEntry: async () => ({ snapshot: structuredClone(trip), version: 1, geos: [] }),
       applyLocalOp: () => {},
       invalidate: () => {
         invalidateCount.value++;

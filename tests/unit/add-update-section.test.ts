@@ -249,21 +249,30 @@ describe("updateSection guards", () => {
       heading: "My places",
     });
     expect(res.isError).toBe(true);
-    expect(res.content[0]!.text).toContain("default place list");
+    expect(res.content[0]!.text).toContain("Places to visit");
     expect(submittedOps).toHaveLength(0);
   });
 
   it("allows renaming a genuine custom section", async () => {
-    const { ctx, submittedOps } = makeFakeContext(checklistTrip);
+    const trip = fresh(checklistTrip);
+    trip.itinerary.sections.push({
+      id: 999,
+      type: "normal",
+      mode: "placeList",
+      heading: "Food",
+      date: null,
+      blocks: [],
+    });
+    const { ctx, submittedOps } = makeFakeContext(trip);
     const res = await updateSection(ctx, {
       trip_key: "T",
-      section: "Notes",
+      section: "Food",
       heading: "Trip Notes",
     });
     expect(res.isError).toBeUndefined();
     expect(submittedOps).toHaveLength(1);
     expect(submittedOps[0]![0]!).toMatchObject({
-      od: "Notes",
+      od: "Food",
       oi: "Trip Notes",
     });
   });

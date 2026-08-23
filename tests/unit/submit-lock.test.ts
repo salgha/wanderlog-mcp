@@ -1,7 +1,11 @@
 import { describe, expect, it } from "vitest";
 import type { AppContext } from "../../src/context.ts";
 import type { Json0Op } from "../../src/ot/apply.ts";
-import { submitOp } from "../../src/tools/shared.ts";
+import {
+  buildAndSubmitOp,
+  submitOp,
+  submitLockCountForTests,
+} from "../../src/tools/shared.ts";
 
 /**
  * Exercises the per-trip submit mutex in isolation. Uses a fake AppContext
@@ -157,5 +161,59 @@ describe("submitOp per-trip mutex", () => {
     await submitOp(holder.ctx, "tripA", ops);
     expect(holder.applyLocalOpCount).toBe(1);
     expect(holder.invalidateCount).toBe(0);
+  });
+
+  it("invalidates instead of applying the original op after a remote op during submit", async () => {
+    let resolveSubmit!: (outcome: { remoteOpObserved: boolean }) => void;
+    let applyLocalOpCount = 0;
+    let invalidateCount = 0;
+    const client = {
+      isSubscribed: true,
+      version: 7,
+      submit: () =>
+        new Promise<{ remoteOpObserved: boolean }>((resolve) => {
+          resolveSubmit = resolve;
+        }),
+    };
+    const ctx = {
+      pool: { get: () => client },
+      tripCache: {
+        applyLocalOp: () => {
+          applyLocalOpCount++;
+        },
+        invalidate: () => {
+          invalidateCount++;
+        },
+      },
+    } as unknown as AppContext;
+    const ops: Json0Op[] = [{ p: ["title"], oi: "Local" }];
+
+    const pending = submitOp(ctx, "contended-trip", ops);
+    await Promise.resolve();
+    expect(invalidateCount).toBe(0);
+    resolveSubmit({ remoteOpObserved: true });
+    await pending;
+
+    expect(invalidateCount).toBe(1);
+    expect(applyLocalOpCount).toBe(0);
+  });
+
+  it("evicts settled lock tails after invalid trip validation", async () => {
+    const ctx = {
+      tripCache: {
+        getEntry: async (tripKey: string) => {
+          throw new Error(`unknown trip ${tripKey}`);
+        },
+      },
+    } as unknown as AppContext;
+
+    await Promise.allSettled(
+      Array.from({ length: 20 }, (_, index) =>
+        buildAndSubmitOp(ctx, `bogus-${index}`, () => ({ ops: [], result: null })),
+      ),
+    );
+    await Promise.resolve();
+
+    expect(submitLockCountForTests()).toBe(0);
   });
 });

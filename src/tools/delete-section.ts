@@ -1,35 +1,26 @@
 import { z } from "zod";
 import type { AppContext } from "../context.js";
-import { WanderlogError, WanderlogValidationError } from "../errors.js";
+import { WanderlogError } from "../errors.js";
 import type { Json0Op } from "../ot/apply.js";
 import {
-  findPlacesToVisitSection,
-  findSectionByRef,
-  submitOp,
-} from "./shared.js";
+  assertCustomSectionMutable,
+  requireSectionRef,
+} from "./section-shared.js";
+import { buildAndSubmitOp } from "./shared.js";
 
 export const deleteSectionInputSchema = {
-  trip_key: z
-    .string()
-    .min(1)
-    .describe("The trip to delete the section from."),
+  trip_key: z.string().min(1).describe("The trip containing the custom section."),
   section: z
     .string()
+    .trim()
     .min(1)
-    .describe(
-      "The section to delete, identified by its heading (e.g. 'Food & Drink'). Use wanderlog_get_trip to see available sections.",
-    ),
+    .describe("Custom section heading. Supports ordinal references for duplicate headings."),
 };
 
 export const deleteSectionDescription = `
-Deletes a custom section from a Wanderlog trip itinerary. The section and all blocks inside it
-are permanently removed.
-
-Only custom sections (created via wanderlog_add_section or the Wanderlog UI) can be deleted.
-Day sections, the default "Places to visit" list, and system sections (hotels, flights, transit)
-are protected and cannot be removed with this tool.
-
-Returns a confirmation with the deleted section's heading.
+Permanently deletes a custom section and every block inside it. Day sections, the default
+Places to visit list, and system sections are protected. This operation cannot be undone through
+this MCP tool, so use it only when the user explicitly asks to delete the section.
 `.trim();
 
 type Args = {
@@ -37,56 +28,38 @@ type Args = {
   section: string;
 };
 
-const SYSTEM_SECTION_TYPES = new Set(["hotels", "flights", "transit"]);
-
 export async function deleteSection(
   ctx: AppContext,
   args: Args,
 ): Promise<{ content: Array<{ type: "text"; text: string }>; isError?: boolean }> {
   try {
-    const entry = await ctx.tripCache.getEntry(args.trip_key);
-    const trip = entry.snapshot;
+    const result = await buildAndSubmitOp(ctx, args.trip_key, (trip) => {
+      const match = requireSectionRef(trip, args.section);
+      assertCustomSectionMutable(trip, match);
+      const ops: Json0Op[] = [{
+        p: ["itinerary", "sections", match.index],
+        ld: match.section,
+      }];
+      return {
+        ops,
+        result: {
+          heading: match.section.heading,
+          blockCount: match.section.blocks.length,
+          title: trip.title,
+        },
+      };
+    });
 
-    const found = findSectionByRef(trip, args.section);
-    if (!found) {
-      throw new WanderlogValidationError(
-        `Section "${args.section}" not found in trip "${trip.title}". Use wanderlog_get_trip to see available sections.`,
-      );
-    }
-
-    const { index, section } = found;
-
-    if (section.mode === "dayPlan") {
-      throw new WanderlogValidationError(
-        `Day sections cannot be deleted here. Use wanderlog_update_trip_dates to change the trip's date range instead.`,
-      );
-    }
-
-    if (findPlacesToVisitSection(trip)?.index === index) {
-      throw new WanderlogValidationError(
-        `The "Places to visit" section cannot be deleted — it is the trip's default place list.`,
-      );
-    }
-
-    if (SYSTEM_SECTION_TYPES.has(section.type)) {
-      throw new WanderlogValidationError(
-        `The "${section.heading || section.type}" section is a system section and cannot be deleted.`,
-      );
-    }
-
-    const ops: Json0Op[] = [
-      { p: ["itinerary", "sections", index], ld: section },
-    ];
-    await submitOp(ctx, args.trip_key, ops);
-
-    const label = section.heading || "(untitled)";
-    const text = `Deleted section "${label}" from "${trip.title}".`;
-    return { content: [{ type: "text", text }] };
+    return {
+      content: [{
+        type: "text",
+        text: `Deleted custom section "${result.heading}" and its ${result.blockCount} block(s) from "${result.title}".`,
+      }],
+    };
   } catch (err) {
-    const msg =
-      err instanceof WanderlogError
-        ? err.toUserMessage()
-        : `Unexpected error: ${(err as Error).message}`;
-    return { content: [{ type: "text", text: msg }], isError: true };
+    const text = err instanceof WanderlogError
+      ? err.toUserMessage()
+      : `Unexpected error: ${(err as Error).message}`;
+    return { content: [{ type: "text", text }], isError: true };
   }
 }

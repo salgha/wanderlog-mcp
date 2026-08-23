@@ -3,7 +3,7 @@ import type { AppContext } from "../context.js";
 import { WanderlogError } from "../errors.js";
 import type { Json0Op } from "../ot/apply.js";
 import type { JournalStop, PlaceData } from "../types.js";
-import { findTripCenter, generateBlockId, submitOp } from "./shared.js";
+import { buildAndSubmitOp, findTripCenter, generateBlockId } from "./shared.js";
 import { findTripPlaces, getJournalStops, placeItineraryDate } from "./journal-shared.js";
 
 export const addJournalInputSchema = {
@@ -61,6 +61,16 @@ type Args = {
   allow_new_place?: boolean;
 };
 
+type AddJournalResult =
+  | { kind: "error"; text: string }
+  | {
+      kind: "added";
+      date: string;
+      title: string;
+      place: PlaceData;
+      linkedToTrip: boolean;
+    };
+
 /**
  * Wanderlog stores each stop's dateTime with a destination timezone offset
  * (e.g. "+08:00"). We don't carry a tz database, so reuse the offset from an
@@ -83,39 +93,11 @@ export async function addJournal(
     const entry = await ctx.tripCache.getEntry(args.trip_key);
     const trip = entry.snapshot;
 
-    // Tier 1: reuse a place the trip already references (itinerary or journal).
+    // A new-place lookup may remain outside the lock, but final place selection
+    // is repeated against the locked snapshot below.
     const existing = findTripPlaces(trip, args.place);
-    let place: PlaceData;
-    let linkedToTrip: boolean;
-
-    if (existing.length > 1) {
-      const lines = existing.slice(0, 10).map((p, i) => `  ${i + 1}. ${p.name}`).join("\n");
-      return {
-        content: [
-          {
-            type: "text",
-            text: `"${args.place}" matches ${existing.length} places already in "${trip.title}":\n${lines}\n\nRe-call with a more specific name.`,
-          },
-        ],
-        isError: true,
-      };
-    }
-
-    if (existing.length === 1) {
-      place = existing[0]!;
-      linkedToTrip = true;
-    } else if (!args.allow_new_place) {
-      // Tier 2: not in the trip — prompt rather than silently adding a new place.
-      return {
-        content: [
-          {
-            type: "text",
-            text: `"${args.place}" isn't a place in "${trip.title}" yet. Add it to the trip first with wanderlog_add_place and then journal it, or re-call wanderlog_add_journal with allow_new_place: true to add it as a new (unplanned) journal place.`,
-          },
-        ],
-        isError: true,
-      };
-    } else {
+    let searchedPlace: PlaceData | undefined;
+    if (existing.length === 0 && args.allow_new_place) {
       // Override: search for the place and embed a fresh result.
       const center = findTripCenter(trip, entry.geos);
       if (!center) {
@@ -143,47 +125,81 @@ export async function addJournal(
           },
         );
       }
-      place = await ctx.rest.getPlaceDetails(predictions[0]!.place_id);
-      linkedToTrip = false;
+      searchedPlace = await ctx.rest.getPlaceDetails(predictions[0]!.place_id);
     }
 
-    const stops = getJournalStops(trip).map((m) => m.stop);
-    // Default to the day this place is scheduled on in the itinerary, else today.
-    const date =
-      args.date ?? placeItineraryDate(trip, place) ?? new Date().toISOString().slice(0, 10);
-    const time = args.time ?? "09:00";
-    const dateTime = `${date}T${time}${existingStopOffset(stops)}`;
+    const result = await buildAndSubmitOp<AddJournalResult>(ctx, args.trip_key, (currentTrip) => {
+      const currentExisting = findTripPlaces(currentTrip, args.place);
+      if (currentExisting.length > 1) {
+        const lines = currentExisting
+          .slice(0, 10)
+          .map((candidate, index) => `  ${index + 1}. ${candidate.name}`)
+          .join("\n");
+        return {
+          ops: [],
+          result: {
+            kind: "error" as const,
+            text: `"${args.place}" matches ${currentExisting.length} places already in "${currentTrip.title}":\n${lines}\n\nRe-call with a more specific name.`,
+          },
+        };
+      }
 
-    const stop: Record<string, unknown> = {
-      id: generateBlockId(),
-      type: "confirmed",
-      title: args.title ?? place.name,
-      dateTime,
-      place,
-      media: [],
-    };
-    if (args.text) {
-      stop.text = { ops: [{ insert: args.text }] };
-    }
-
-    const ops: Json0Op[] = [
-      {
+      const place = currentExisting[0] ?? searchedPlace;
+      if (!place) {
+        return {
+          ops: [],
+          result: {
+            kind: "error" as const,
+            text: `"${args.place}" isn't a place in "${currentTrip.title}" yet. Add it to the trip first with wanderlog_add_place and then journal it, or re-call wanderlog_add_journal with allow_new_place: true to add it as a new (unplanned) journal place.`,
+          },
+        };
+      }
+      const linkedToTrip = currentExisting.length === 1;
+      const stops = getJournalStops(currentTrip).map((match) => match.stop);
+      // Default to the day this place is scheduled on in the itinerary, else today.
+      const date =
+        args.date ?? placeItineraryDate(currentTrip, place) ?? new Date().toISOString().slice(0, 10);
+      const time = args.time ?? "09:00";
+      const dateTime = `${date}T${time}${existingStopOffset(stops)}`;
+      const stop: Record<string, unknown> = {
+        id: generateBlockId(),
+        type: "confirmed",
+        title: args.title ?? place.name,
+        dateTime,
+        place,
+        media: [],
+      };
+      if (args.text) {
+        stop.text = { ops: [{ insert: args.text }] };
+      }
+      const ops: Json0Op[] = [{
         p: ["itinerary", "journal", "stops", stops.length],
         li: stop,
-      },
-    ];
+      }];
+      return {
+        ops,
+        result: {
+          kind: "added" as const,
+          date,
+          title: currentTrip.title,
+          place,
+          linkedToTrip,
+        },
+      };
+    });
 
-    await submitOp(ctx, args.trip_key, ops);
-
-    const titleLabel = args.title ?? place.name;
-    const suffix = linkedToTrip
+    if (result.kind === "error") {
+      return { content: [{ type: "text", text: result.text }], isError: true };
+    }
+    const titleLabel = args.title ?? result.place.name;
+    const suffix = result.linkedToTrip
       ? " (reused a place already in your trip)"
-      : ` (new place — ${place.name} wasn't in your itinerary)`;
+      : ` (new place — ${result.place.name} wasn't in your itinerary)`;
     return {
       content: [
         {
           type: "text",
-          text: `Added journal stop "${titleLabel}" (${date}) at ${place.name} in "${trip.title}"${suffix}.`,
+          text: `Added journal stop "${titleLabel}" (${result.date}) at ${result.place.name} in "${result.title}"${suffix}.`,
         },
       ],
     };

@@ -1,7 +1,9 @@
 import type { AppContext } from "../context.js";
 import { WanderlogError, WanderlogValidationError } from "../errors.js";
 import type { Json0Op } from "../ot/apply.js";
-import { resolveDay } from "../resolvers/day.js";
+import type { SubmitOutcome } from "../transport/sharedb.js";
+import { resolveSectionRef } from "../resolvers/section-ref.js";
+import { resolveBlockDestination } from "../resolvers/section-target.js";
 import type {
   Block,
   ChecklistItem,
@@ -22,6 +24,11 @@ import { isPlaceBlock } from "../types.js";
  */
 const submitLocks = new Map<string, Promise<unknown>>();
 
+/** Test-only visibility for lock-lifecycle regression coverage. */
+export function submitLockCountForTests(): number {
+  return submitLocks.size;
+}
+
 async function withSubmitLock<T>(
   tripKey: string,
   fn: () => Promise<T>,
@@ -30,12 +37,12 @@ async function withSubmitLock<T>(
   // Chain regardless of whether the previous op succeeded or failed —
   // one failed op should not permanently block the queue.
   const next = prev.then(fn, fn);
-  // The map always holds a never-rejecting tail so the next caller can chain
-  // onto it safely. Dead promises are negligible; the map is keyed by trip.
-  submitLocks.set(
-    tripKey,
-    next.catch(() => {}),
-  );
+  const tail = next.catch(() => {});
+  submitLocks.set(tripKey, tail);
+  void tail.then(() => {
+    // A newer queued call may have replaced this tail while it was pending.
+    if (submitLocks.get(tripKey) === tail) submitLocks.delete(tripKey);
+  });
   return next;
 }
 
@@ -57,49 +64,89 @@ export async function submitOp(
   ops: Json0Op[],
 ): Promise<void> {
   return withSubmitLock(tripKey, async () => {
-    const client = ctx.pool.get(tripKey);
-    if (!client.isSubscribed) {
-      throw new WanderlogError(
-        `Trip ${tripKey} is not subscribed — call tripCache.get() first`,
-        "not_subscribed",
-      );
-    }
-    try {
-      await submitWithRateLimitRetry(client, ops);
-      ctx.tripCache.applyLocalOp(tripKey, ops, client.version);
-    } catch (err) {
-      // Any submit failure leaves our cached view possibly inconsistent with
-      // the server. Invalidate so the next get() refetches + resubscribes.
-      ctx.tripCache.invalidate(tripKey);
-      throw err;
-    }
+    await submitLocked(ctx, tripKey, ops);
   });
+}
+
+export async function buildAndSubmitOp<T>(
+  ctx: AppContext,
+  tripKey: string,
+  build: (trip: TripPlan) => { ops: Json0Op[]; result: T },
+): Promise<T> {
+  return withSubmitLock(tripKey, async () => {
+    const entry = await ctx.tripCache.getEntry(tripKey);
+    const { ops, result } = build(entry.snapshot);
+    if (ops.length > 0) await submitLocked(ctx, tripKey, ops);
+    return result;
+  });
+}
+
+async function submitLocked(
+  ctx: AppContext,
+  tripKey: string,
+  ops: Json0Op[],
+): Promise<void> {
+  const client = ctx.pool.get(tripKey);
+  if (!client.isSubscribed) {
+    throw new WanderlogError(
+      `Trip ${tripKey} is not subscribed — call tripCache.get() first`,
+      "not_subscribed",
+    );
+  }
+  try {
+    const outcome = await submitWithRateLimitRetry(client, ops);
+    if (outcome?.remoteOpObserved) {
+      // The server may have transformed our op against the remote change. Since
+      // the ack does not include that transformed op, discard the cache only
+      // after the ack and rebuild it from a fresh subscription on the next read.
+      ctx.tripCache.invalidate(tripKey);
+      return;
+    }
+    ctx.tripCache.applyLocalOp(tripKey, ops, client.version);
+  } catch (err) {
+    // Any submit failure leaves our cached view possibly inconsistent with
+    // the server. Invalidate so the next get() refetches + resubscribes.
+    ctx.tripCache.invalidate(tripKey);
+    throw err;
+  }
 }
 
 const RATE_LIMIT_RETRY_DELAYS_MS = [2_000, 4_000, 8_000];
 
-// A rate-limited op (code 4001) is rejected before the server processes it —
-// it never acks and never applies — so resubmitting the same ops at the same
-// version is safe. Burst mutations (e.g. an LLM building a full itinerary)
-// hit the limit routinely; waiting out the window beats surfacing an error.
+// A rate-limited op (code 4001) is rejected before the server processes it.
+// Resubmission is safe only while no remote op has advanced the subscribed
+// document; otherwise the caller must discard and rebuild from a fresh snapshot.
 async function submitWithRateLimitRetry(
-  client: { submit(ops: Json0Op[]): Promise<void> },
+  client: {
+    remoteOpGeneration: number;
+    submit(ops: Json0Op[]): Promise<SubmitOutcome | void>;
+  },
   ops: Json0Op[],
-): Promise<void> {
+): Promise<SubmitOutcome | void> {
+  const startingRemoteOpGeneration = client.remoteOpGeneration;
+  const assertRetryIsFresh = () => {
+    if (client.remoteOpGeneration !== startingRemoteOpGeneration) {
+      throw new WanderlogError(
+        "Cannot retry the rate-limited operation because the remote document advanced",
+        "stale_rate_limit_retry",
+      );
+    }
+  };
   let attempt = 0;
   for (;;) {
     try {
-      await client.submit(ops);
-      return;
+      return await client.submit(ops);
     } catch (err) {
       const isRateLimit =
         err instanceof WanderlogError && err.code === "rate_limited";
       if (!isRateLimit || attempt >= RATE_LIMIT_RETRY_DELAYS_MS.length) {
         throw err;
       }
+      assertRetryIsFresh();
       await new Promise((r) =>
         setTimeout(r, RATE_LIMIT_RETRY_DELAYS_MS[attempt]),
       );
+      assertRetryIsFresh();
       attempt += 1;
     }
   }
@@ -139,17 +186,8 @@ export function findSectionByRef(
   trip: TripPlan,
   ref: string,
 ): { index: number; section: Section } | null {
-  const normalized = ref.trim().toLowerCase();
-  if (normalized === "places to visit" || normalized === "places") {
-    return findPlacesToVisitSection(trip);
-  }
-  for (let i = 0; i < trip.itinerary.sections.length; i++) {
-    const s = trip.itinerary.sections[i]!;
-    if (s.heading.trim().toLowerCase() === normalized) {
-      return { index: i, section: s };
-    }
-  }
-  return null;
+  const result = resolveSectionRef(trip, ref);
+  return result.kind === "unique" ? result.match : null;
 }
 
 export function requireUserId(ctx: AppContext): number {
@@ -280,33 +318,11 @@ export function findTripCenter(
  * Resolves the target section for adding a block — either a specific day
  * or the "Places to visit" list. Shared by add-place, add-note, add-checklist.
  */
-export type TargetSection = {
-  index: number;
-  section: Section;
-  label: string;
-};
-
 export function findTargetSection(
   trip: TripPlan,
   day?: string,
-): TargetSection {
-  if (day) {
-    const daySection = resolveDay(trip, day);
-    const found = findDaySectionByDate(trip, daySection.date!);
-    if (!found) {
-      throw new WanderlogValidationError(`Day ${day} not found in trip`);
-    }
-    return { index: found.index, section: found.section, label: `day ${daySection.date}` };
-  }
-  const places = findPlacesToVisitSection(trip);
-  if (!places) {
-    throw new WanderlogError(
-      "Trip has no 'Places to visit' list",
-      "no_places_section",
-      "This is unexpected — Wanderlog usually creates one automatically. Try adding to a specific day instead.",
-    );
-  }
-  return { index: places.index, section: places.section, label: "places to visit" };
+): { index: number; section: Section; label: string } {
+  return resolveBlockDestination(trip, { day }, "note");
 }
 
 /** Build a note block matching the shape captured from the Wanderlog UI. */

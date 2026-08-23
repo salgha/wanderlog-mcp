@@ -95,7 +95,11 @@ export function parseOrdinal(ref: string): ParsedOrdinal | null {
  * Diacritics are not normalized: "Senso-ji" will not match "Sensō-ji".
  * Whitespace is collapsed and trimmed before matching.
  */
-export function resolvePlaceRef(trip: TripPlan, ref: string): PlaceRefResult {
+export function resolvePlaceRef(
+  trip: TripPlan,
+  ref: string,
+  sectionIndices?: number[],
+): PlaceRefResult {
   const normalized = normalize(ref);
   if (!normalized) {
     return { kind: "none" };
@@ -109,10 +113,11 @@ export function resolvePlaceRef(trip: TripPlan, ref: string): PlaceRefResult {
   const ordinal = parseOrdinal(normalized);
   const body = ordinal ? ordinal.rest : normalized;
 
+  const allowed = sectionIndices ? new Set(sectionIndices) : undefined;
   const compound = splitCompound(body);
   const candidates = compound
-    ? filterByContext(trip, findByLeftSide(trip, compound.left), compound.right)
-    : findByLeftSide(trip, body);
+    ? filterByContext(trip, findByLeftSide(trip, compound.left, allowed), compound.right)
+    : findByLeftSide(trip, body, allowed);
 
   if (ordinal) {
     if (candidates.length === 0) return { kind: "none" };
@@ -127,32 +132,41 @@ export function resolvePlaceRef(trip: TripPlan, ref: string): PlaceRefResult {
   return finalize(candidates);
 }
 
-function findByLeftSide(trip: TripPlan, ref: string): PlaceRefMatch[] {
-  const roleMatches = matchRoleKeyword(trip, ref);
+function findByLeftSide(
+  trip: TripPlan,
+  ref: string,
+  allowed?: Set<number>,
+): PlaceRefMatch[] {
+  const roleMatches = matchRoleKeyword(trip, ref, allowed);
   if (roleMatches.length > 0) {
     return roleMatches;
   }
 
-  const exact = matchPlaceName(trip, ref, "exact");
+  const exact = matchPlaceName(trip, ref, "exact", allowed);
   if (exact.length > 0) {
     return exact;
   }
 
-  return matchPlaceName(trip, ref, "substring");
+  return matchPlaceName(trip, ref, "substring", allowed);
 }
 
-function matchRoleKeyword(trip: TripPlan, ref: string): PlaceRefMatch[] {
+function matchRoleKeyword(
+  trip: TripPlan,
+  ref: string,
+  allowed?: Set<number>,
+): PlaceRefMatch[] {
   if (HOTEL_KEYWORDS.has(ref)) {
-    return firstBlockOfSectionType(trip, (s) => s.type === "hotels");
+    return firstBlockOfSectionType(trip, (s) => s.type === "hotels", undefined, allowed);
   }
   if (FLIGHT_KEYWORDS.has(ref)) {
-    return firstBlockOfSectionType(trip, (s) => s.type === "flights");
+    return firstBlockOfSectionType(trip, (s) => s.type === "flights", undefined, allowed);
   }
   if (TRAIN_KEYWORDS.has(ref)) {
     return firstBlockOfSectionType(
       trip,
       (s) => s.type === "transit",
       (b) => b.type === "train",
+      allowed,
     );
   }
   if (FERRY_KEYWORDS.has(ref)) {
@@ -160,6 +174,7 @@ function matchRoleKeyword(trip: TripPlan, ref: string): PlaceRefMatch[] {
       trip,
       (s) => s.type === "transit",
       (b) => b.type === "ferry",
+      allowed,
     );
   }
   if (BUS_KEYWORDS.has(ref)) {
@@ -167,10 +182,11 @@ function matchRoleKeyword(trip: TripPlan, ref: string): PlaceRefMatch[] {
       trip,
       (s) => s.type === "transit",
       (b) => b.type === "bus",
+      allowed,
     );
   }
   if (RENTAL_CAR_KEYWORDS.has(ref)) {
-    return firstBlockOfSectionType(trip, (s) => s.type === "rentalCars");
+    return firstBlockOfSectionType(trip, (s) => s.type === "rentalCars", undefined, allowed);
   }
   return [];
 }
@@ -179,9 +195,11 @@ function firstBlockOfSectionType(
   trip: TripPlan,
   sectionPredicate: (s: Section) => boolean,
   blockPredicate?: (b: Block) => boolean,
+  allowed?: Set<number>,
 ): PlaceRefMatch[] {
   const sections = trip.itinerary.sections;
   for (let sectionIndex = 0; sectionIndex < sections.length; sectionIndex++) {
+    if (allowed && !allowed.has(sectionIndex)) continue;
     const section = sections[sectionIndex]!;
     if (!sectionPredicate(section)) continue;
     for (let blockIndex = 0; blockIndex < section.blocks.length; blockIndex++) {
@@ -197,10 +215,12 @@ function matchPlaceName(
   trip: TripPlan,
   ref: string,
   mode: "exact" | "substring",
+  allowed?: Set<number>,
 ): PlaceRefMatch[] {
   const matches: PlaceRefMatch[] = [];
   const sections = trip.itinerary.sections;
   for (let sectionIndex = 0; sectionIndex < sections.length; sectionIndex++) {
+    if (allowed && !allowed.has(sectionIndex)) continue;
     const section = sections[sectionIndex]!;
     for (let blockIndex = 0; blockIndex < section.blocks.length; blockIndex++) {
       const block = section.blocks[blockIndex]!;

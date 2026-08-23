@@ -42,6 +42,10 @@ type OpFrame = {
 
 type Frame = InitFrame | HandshakeAckFrame | SubscribeAckFrame | OpFrame;
 
+export type SubmitOutcome = {
+  remoteOpObserved: boolean;
+};
+
 export interface ShareDBClient {
   /** Fired when a remote op (not one we submitted) is received. */
   on(event: "remoteOp", listener: (ops: Json0Op[], version: number) => void): this;
@@ -65,6 +69,7 @@ export class ShareDBClient extends EventEmitter {
   private seqCounter = 0;
   private snapshot?: TripPlan;
   private _version = 0;
+  private _remoteOpGeneration = 0;
   private subscribed = false;
   private subscribePending?: {
     resolve: (ack: SubscribeAckFrame) => void;
@@ -72,7 +77,12 @@ export class ShareDBClient extends EventEmitter {
   };
   private readonly pendingOps = new Map<
     number,
-    { resolve: () => void; reject: (err: Error) => void; timer: NodeJS.Timeout }
+    {
+      resolve: (outcome: SubmitOutcome) => void;
+      reject: (err: Error) => void;
+      timer: NodeJS.Timeout;
+      remoteOpObserved: boolean;
+    }
   >();
   private connectPromise?: Promise<void>;
   private reconnectTimer?: NodeJS.Timeout;
@@ -86,6 +96,10 @@ export class ShareDBClient extends EventEmitter {
 
   get version(): number {
     return this._version;
+  }
+
+  get remoteOpGeneration(): number {
+    return this._remoteOpGeneration;
   }
 
   get currentSnapshot(): TripPlan | undefined {
@@ -263,11 +277,15 @@ export class ShareDBClient extends EventEmitter {
       this.pendingOps.delete(frame.seq!);
       clearTimeout(pending.timer);
       this._version = frame.v + 1;
-      pending.resolve();
+      pending.resolve({ remoteOpObserved: pending.remoteOpObserved });
       return;
     }
 
     if (frame.op && frame.op.length > 0) {
+      for (const pending of this.pendingOps.values()) {
+        pending.remoteOpObserved = true;
+      }
+      this._remoteOpGeneration += 1;
       this._version = frame.v + 1;
       this.emit("remoteOp", frame.op, this._version);
     }
@@ -364,7 +382,7 @@ export class ShareDBClient extends EventEmitter {
    *
    * On successful ack, the local version is bumped to `frame.v + 1`.
    */
-  async submit(ops: Json0Op[]): Promise<void> {
+  async submit(ops: Json0Op[]): Promise<SubmitOutcome> {
     if (!this.subscribed) {
       throw new WanderlogError(
         "Cannot submit op before subscribing to the trip",
@@ -387,14 +405,19 @@ export class ShareDBClient extends EventEmitter {
       op: ops,
     };
 
-    return new Promise<void>((resolve, reject) => {
+    return new Promise<SubmitOutcome>((resolve, reject) => {
       const timer = setTimeout(() => {
         if (this.pendingOps.has(seq)) {
           this.pendingOps.delete(seq);
           reject(new WanderlogError("Submit op timeout", "submit_timeout"));
         }
       }, 10_000);
-      this.pendingOps.set(seq, { resolve, reject, timer });
+      this.pendingOps.set(seq, {
+        resolve,
+        reject,
+        timer,
+        remoteOpObserved: false,
+      });
       try {
         this.send(frame);
       } catch (err) {
@@ -441,6 +464,13 @@ export class ShareDBPool {
 
   has(tripKey: string): boolean {
     return this.clients.has(tripKey);
+  }
+
+  discard(tripKey: string): void {
+    const client = this.clients.get(tripKey);
+    if (!client) return;
+    this.clients.delete(tripKey);
+    client.close();
   }
 
   closeAll(): void {

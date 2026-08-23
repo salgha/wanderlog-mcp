@@ -4,10 +4,10 @@ import { WanderlogError } from "../errors.js";
 import type { TransitEndpoint } from "../types.js";
 import {
   buildTransitBlock,
+  buildAndSubmitOp,
   requireUserId,
   resolveEndpointPlace,
   sectionInsertOp,
-  submitOp,
   validateChronology,
 } from "./shared.js";
 
@@ -106,10 +106,12 @@ export async function addTransit(
       notes: args.notes,
     });
 
-    const op = sectionInsertOp(trip, "transit", block);
-    await submitOp(ctx, args.trip_key, [op]);
+    const title = await buildAndSubmitOp(ctx, args.trip_key, (currentTrip) => ({
+      ops: [sectionInsertOp(currentTrip, "transit", block)],
+      result: currentTrip.title,
+    }));
 
-    const text = `Added ${args.type} ${args.carrier} to "${trip.title}" · ${fromPlace.name} → ${toPlace.name} · ${args.depart_date} ${args.depart_time}.`;
+    const text = `Added ${args.type} ${args.carrier} to "${title}" · ${fromPlace.name} → ${toPlace.name} · ${args.depart_date} ${args.depart_time}.`;
     return { content: [{ type: "text", text }] };
   } catch (err) {
     const msg =

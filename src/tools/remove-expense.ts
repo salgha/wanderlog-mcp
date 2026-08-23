@@ -7,7 +7,7 @@ import {
   formatCandidateList,
   formatExpense,
 } from "./expenses-shared.js";
-import { submitOp } from "./shared.js";
+import { buildAndSubmitOp } from "./shared.js";
 
 export const removeExpenseInputSchema = {
   trip_key: z.string().min(1).describe("The trip to remove the expense from."),
@@ -54,47 +54,46 @@ export async function removeExpense(
   args: Args,
 ): Promise<{ content: Array<{ type: "text"; text: string }>; isError?: boolean }> {
   try {
-    const trip = await ctx.tripCache.get(args.trip_key);
-    const matches = findExpenseMatches(trip, {
-      description: args.description,
-      date: args.date,
-      amount: args.amount,
-      currency: args.currency,
-    });
-
-    if (matches.length === 0) {
-      throw new WanderlogNotFoundError("Expense", args.description);
-    }
-
-    if (matches.length > 1) {
-      return {
-        content: [
-          {
-            type: "text",
+    const result = await buildAndSubmitOp<{
+      kind: "error" | "removed";
+      text: string;
+    }>(ctx, args.trip_key, (trip) => {
+      const matches = findExpenseMatches(trip, {
+        description: args.description,
+        date: args.date,
+        amount: args.amount,
+        currency: args.currency,
+      });
+      if (matches.length === 0) {
+        throw new WanderlogNotFoundError("Expense", args.description);
+      }
+      if (matches.length > 1) {
+        return {
+          ops: [],
+          result: {
+            kind: "error" as const,
             text: `"${args.description}" matches ${matches.length} expenses:\n${formatCandidateList(matches)}\n\nRe-call with a more specific description, or add a date / amount / currency filter to pick one.`,
           },
-        ],
-        isError: true,
-      };
-    }
+        };
+      }
 
-    const { index, expense } = matches[0]!;
-    const ops: Json0Op[] = [
-      {
+      const { index, expense } = matches[0]!;
+      const ops: Json0Op[] = [{
         p: ["itinerary", "budget", "expenses", index],
         ld: expense,
-      },
-    ];
-
-    await submitOp(ctx, args.trip_key, ops);
-
-    return {
-      content: [
-        {
-          type: "text",
+      }];
+      return {
+        ops,
+        result: {
+          kind: "removed" as const,
           text: `Removed expense ${formatExpense(expense)} from "${trip.title}".`,
         },
-      ],
+      };
+    });
+
+    return {
+      content: [{ type: "text", text: result.text }],
+      ...(result.kind === "error" ? { isError: true } : {}),
     };
   } catch (err) {
     const msg =

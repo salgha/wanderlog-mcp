@@ -34,6 +34,7 @@ function makeFakeContext(trip: TripPlan): {
     },
     tripCache: {
       get: async () => structuredClone(trip),
+      getEntry: async () => ({ snapshot: structuredClone(trip), version: 1, geos: [] }),
       applyLocalOp: () => {},
       invalidate: () => {
         invalidateCount.value++;
@@ -147,10 +148,10 @@ describe("findNoteMatches", () => {
   it("filters by day when day is specified", () => {
     const trip = fresh(checklistTrip);
     // The sunscreen note is on 2026-06-01 (day 1)
-    const onDay1 = findNoteMatches(trip, "sunscreen", "day 1");
+    const onDay1 = findNoteMatches(trip, "sunscreen", { day: "day 1" });
     expect(onDay1).toHaveLength(1);
 
-    const onDay2 = findNoteMatches(trip, "sunscreen", "day 2");
+    const onDay2 = findNoteMatches(trip, "sunscreen", { day: "day 2" });
     expect(onDay2).toHaveLength(0);
   });
 

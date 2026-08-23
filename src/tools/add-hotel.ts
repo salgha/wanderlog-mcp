@@ -4,11 +4,11 @@ import { WanderlogError, WanderlogValidationError } from "../errors.js";
 import type { Json0Op } from "../ot/apply.js";
 import type { PlaceData } from "../types.js";
 import {
+  buildAndSubmitOp,
   buildPlaceBlock,
   findHotelsSection,
   findTripCenter,
   requireUserId,
-  submitOp,
 } from "./shared.js";
 
 export const addHotelInputSchema = {
@@ -91,37 +91,38 @@ export async function addHotel(
       },
     });
 
-    const existing = findHotelsSection(trip);
-    const blockPath = existing
-      ? ["itinerary", "sections", existing.index, "blocks", existing.section.blocks.length]
-      : ["itinerary", "sections", 1, "blocks", 0];
-    const ops: Json0Op[] = existing
-      ? [{ p: blockPath, li: block }]
-      : [
-          {
-            // Insert a new hotels section after the Notes section (index 1).
-            // The existing sections shift down by 1.
-            p: ["itinerary", "sections", 1],
-            li: {
-              id: Math.floor(Math.random() * 1_000_000_000),
-              type: "hotels",
-              mode: "placeList",
-              heading: "Hotels and lodging",
-              date: null,
-              blocks: [block],
-              placeMarkerColor: "#7045af",
-              placeMarkerIcon: "bed",
-              text: { ops: [{ insert: "\n" }] },
+    const title = await buildAndSubmitOp(ctx, args.trip_key, (currentTrip) => {
+      const existing = findHotelsSection(currentTrip);
+      const blockPath = existing
+        ? ["itinerary", "sections", existing.index, "blocks", existing.section.blocks.length]
+        : ["itinerary", "sections", 1, "blocks", 0];
+      const ops: Json0Op[] = existing
+        ? [{ p: blockPath, li: block }]
+        : [
+            {
+              // Insert a new hotels section after the Notes section (index 1).
+              // The existing sections shift down by 1.
+              p: ["itinerary", "sections", 1],
+              li: {
+                id: Math.floor(Math.random() * 1_000_000_000),
+                type: "hotels",
+                mode: "placeList",
+                heading: "Hotels and lodging",
+                date: null,
+                blocks: [block],
+                placeMarkerColor: "#7045af",
+                placeMarkerIcon: "bed",
+                text: { ops: [{ insert: "\n" }] },
+              },
             },
-          },
-        ];
-    if (imageKeys.length > 0) {
-      ops.push({ p: [...blockPath, "imageKeys"], oi: imageKeys });
-    }
+          ];
+      if (imageKeys.length > 0) {
+        ops.push({ p: [...blockPath, "imageKeys"], oi: imageKeys });
+      }
+      return { ops, result: currentTrip.title };
+    });
 
-    await submitOp(ctx, args.trip_key, ops);
-
-    const text = `Added ${detail.name} to "${trip.title}" · check-in ${args.check_in} → check-out ${args.check_out}.`;
+    const text = `Added ${detail.name} to "${title}" · check-in ${args.check_in} → check-out ${args.check_out}.`;
     return { content: [{ type: "text", text }] };
   } catch (err) {
     const msg =

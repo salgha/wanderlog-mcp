@@ -3,7 +3,7 @@ import type { AppContext } from "../context.js";
 import { WanderlogError, WanderlogNotFoundError } from "../errors.js";
 import type { Json0Op } from "../ot/apply.js";
 import { findStopMatches, formatStop, formatStopCandidateList } from "./journal-shared.js";
-import { submitOp } from "./shared.js";
+import { buildAndSubmitOp } from "./shared.js";
 
 export const removeJournalInputSchema = {
   trip_key: z.string().min(1).describe("The trip to remove the journal stop from."),
@@ -37,39 +37,41 @@ export async function removeJournal(
   args: Args,
 ): Promise<{ content: Array<{ type: "text"; text: string }>; isError?: boolean }> {
   try {
-    const trip = await ctx.tripCache.get(args.trip_key);
-    const matches = findStopMatches(trip, { title: args.title, date: args.date });
-
-    if (matches.length === 0) {
-      throw new WanderlogNotFoundError("Journal stop", args.title);
-    }
-
-    if (matches.length > 1) {
-      return {
-        content: [
-          {
-            type: "text",
+    const result = await buildAndSubmitOp<{
+      kind: "error" | "removed";
+      text: string;
+    }>(ctx, args.trip_key, (trip) => {
+      const matches = findStopMatches(trip, { title: args.title, date: args.date });
+      if (matches.length === 0) {
+        throw new WanderlogNotFoundError("Journal stop", args.title);
+      }
+      if (matches.length > 1) {
+        return {
+          ops: [],
+          result: {
+            kind: "error" as const,
             text: `"${args.title}" matches ${matches.length} journal stops:\n${formatStopCandidateList(matches)}\n\nRe-call with a more specific title, or add a date filter to pick one.`,
           },
-        ],
-        isError: true,
-      };
-    }
+        };
+      }
 
-    const { index, stop } = matches[0]!;
-    const ops: Json0Op[] = [
-      {
+      const { index, stop } = matches[0]!;
+      const ops: Json0Op[] = [{
         p: ["itinerary", "journal", "stops", index],
         ld: stop,
-      },
-    ];
-
-    await submitOp(ctx, args.trip_key, ops);
+      }];
+      return {
+        ops,
+        result: {
+          kind: "removed" as const,
+          text: `Removed journal stop ${formatStop(stop)} from "${trip.title}".`,
+        },
+      };
+    });
 
     return {
-      content: [
-        { type: "text", text: `Removed journal stop ${formatStop(stop)} from "${trip.title}".` },
-      ],
+      content: [{ type: "text", text: result.text }],
+      ...(result.kind === "error" ? { isError: true } : {}),
     };
   } catch (err) {
     const msg =

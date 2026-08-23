@@ -8,6 +8,7 @@ type CacheEntry = {
   version: number;
   geos: Geo[];
   listener?: (ops: Json0Op[], version: number) => void;
+  reconnectListener?: () => void;
 };
 
 /**
@@ -78,7 +79,26 @@ export class TripCache {
 
     client.on("remoteOp", listener);
 
-    const entry: CacheEntry = { snapshot, version: client.version, geos, listener };
+    const reconnectListener = () => {
+      const current = this.entries.get(tripKey);
+      if (!current) return;
+      const freshSnapshot = client.currentSnapshot;
+      if (!freshSnapshot) {
+        this.deleteEntry(tripKey);
+        return;
+      }
+      current.snapshot = freshSnapshot;
+      current.version = client.version;
+    };
+    client.on("reconnected", reconnectListener);
+
+    const entry: CacheEntry = {
+      snapshot,
+      version: client.version,
+      geos,
+      listener,
+      reconnectListener,
+    };
     this.entries.set(tripKey, entry);
 
     return entry;
@@ -101,8 +121,12 @@ export class TripCache {
       if (entry.listener) {
         const client = this.pool.get(tripKey);
         client.off("remoteOp", entry.listener);
+        if (entry.reconnectListener) {
+          client.off("reconnected", entry.reconnectListener);
+        }
       }
       this.entries.delete(tripKey);
+      this.pool.discard(tripKey);
     }
   }
 

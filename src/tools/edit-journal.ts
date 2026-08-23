@@ -4,7 +4,7 @@ import { WanderlogError, WanderlogNotFoundError, WanderlogValidationError } from
 import type { Json0Op } from "../ot/apply.js";
 import type { JournalStop } from "../types.js";
 import { findStopMatches, formatStop, formatStopCandidateList } from "./journal-shared.js";
-import { submitOp } from "./shared.js";
+import { buildAndSubmitOp } from "./shared.js";
 
 export const editJournalInputSchema = {
   trip_key: z.string().min(1).describe("The trip whose journal to edit."),
@@ -129,65 +129,70 @@ export async function editJournal(
       );
     }
 
-    const trip = await ctx.tripCache.get(args.trip_key);
-    const ops: Json0Op[] = [];
-    const changes: string[] = [];
-    let stopLabel = "";
+    const result = await buildAndSubmitOp<{
+      kind: "error" | "no-change" | "updated";
+      text: string;
+    }>(ctx, args.trip_key, (trip) => {
+      const ops: Json0Op[] = [];
+      const changes: string[] = [];
+      let stopLabel = "";
 
-    if (hasStopEdit) {
-      if (!args.title) {
-        throw new WanderlogValidationError(
-          "Provide 'title' to identify which journal stop to edit.",
-        );
-      }
-      const matches = findStopMatches(trip, { title: args.title, date: args.date });
-      if (matches.length === 0) {
-        throw new WanderlogNotFoundError("Journal stop", args.title);
-      }
-      if (matches.length > 1) {
-        return {
-          content: [
-            {
-              type: "text",
+      if (hasStopEdit) {
+        if (!args.title) {
+          throw new WanderlogValidationError(
+            "Provide 'title' to identify which journal stop to edit.",
+          );
+        }
+        const matches = findStopMatches(trip, { title: args.title, date: args.date });
+        if (matches.length === 0) {
+          throw new WanderlogNotFoundError("Journal stop", args.title);
+        }
+        if (matches.length > 1) {
+          return {
+            ops: [],
+            result: {
+              kind: "error" as const,
               text: `"${args.title}" matches ${matches.length} journal stops:\n${formatStopCandidateList(matches)}\n\nRe-call with a more specific title, or add a date filter to pick one.`,
             },
-          ],
-          isError: true,
+          };
+        }
+        const { index, stop } = matches[0]!;
+        stopLabel = formatStop(stop);
+        const built = buildStopOps(stop, index, args);
+        ops.push(...built.ops);
+        changes.push(...built.changes);
+      }
+
+      if (hasSummaryEdit) {
+        const current = trip.itinerary.journal?.summary;
+        if (args.new_summary !== current) {
+          ops.push(replaceField(["itinerary", "journal", "summary"], current, args.new_summary));
+          changes.push("journal summary");
+        }
+      }
+
+      if (ops.length === 0) {
+        return {
+          ops,
+          result: {
+            kind: "no-change" as const,
+            text: `No changes — those values already match in "${trip.title}".`,
+          },
         };
       }
-      const { index, stop } = matches[0]!;
-      stopLabel = formatStop(stop);
-      const built = buildStopOps(stop, index, args);
-      ops.push(...built.ops);
-      changes.push(...built.changes);
-    }
-
-    if (hasSummaryEdit) {
-      const current = trip.itinerary.journal?.summary;
-      if (args.new_summary !== current) {
-        ops.push(replaceField(["itinerary", "journal", "summary"], current, args.new_summary));
-        changes.push("journal summary");
-      }
-    }
-
-    if (ops.length === 0) {
+      const target = stopLabel ? `stop ${stopLabel}` : "journal";
       return {
-        content: [
-          { type: "text", text: `No changes — those values already match in "${trip.title}".` },
-        ],
-      };
-    }
-
-    await submitOp(ctx, args.trip_key, ops);
-
-    const target = stopLabel ? `stop ${stopLabel}` : "journal";
-    return {
-      content: [
-        {
-          type: "text",
+        ops,
+        result: {
+          kind: "updated" as const,
           text: `Updated ${target} in "${trip.title}": ${changes.join(", ")}.`,
         },
-      ],
+      };
+    });
+
+    return {
+      content: [{ type: "text", text: result.text }],
+      ...(result.kind === "error" ? { isError: true } : {}),
     };
   } catch (err) {
     const msg =

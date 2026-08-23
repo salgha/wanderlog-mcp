@@ -36,13 +36,13 @@ function makeFakeContext(trip: TripPlan): {
 describe("addNoteInputSchema", () => {
   const base = { trip_key: "T", text: "Remember the tickets" };
 
-  it("accepts zero, one, or both targets", () => {
+  it("accepts zero or one target and rejects ambiguous dual targeting", () => {
     expect(addNoteInputSchema.safeParse(base).success).toBe(true);
     expect(addNoteInputSchema.safeParse({ ...base, day: "day 1" }).success).toBe(true);
     expect(addNoteInputSchema.safeParse({ ...base, section: "Notes" }).success).toBe(true);
     expect(
       addNoteInputSchema.safeParse({ ...base, day: "day 1", section: "Notes" }).success,
-    ).toBe(true);
+    ).toBe(false);
   });
 
   it("rejects empty target strings", () => {
@@ -70,7 +70,7 @@ describe("addNote section targeting", () => {
     ]);
   });
 
-  it("lets section override day when both targets are provided", async () => {
+  it("rejects day and section together without submitting operations", async () => {
     const { ctx, submittedOps } = makeFakeContext(checklistTrip);
     const result = await addNote(ctx, {
       trip_key: "T",
@@ -79,15 +79,9 @@ describe("addNote section targeting", () => {
       section: "Notes",
     });
 
-    expect(result.isError).toBeUndefined();
-    expect(result.content[0]!.text).toContain('section "Notes"');
-    expect(submittedOps[0]![0]!.p).toEqual([
-      "itinerary",
-      "sections",
-      0,
-      "blocks",
-      0,
-    ]);
+    expect(result.isError).toBe(true);
+    expect(result.content[0]!.text).toMatch(/either day or section/i);
+    expect(submittedOps).toHaveLength(0);
   });
 
   it("adds a note to a named undated section case-insensitively", async () => {
@@ -100,7 +94,8 @@ describe("addNote section targeting", () => {
 
     expect(result.isError).toBeUndefined();
     expect(result.content[0]!.text).toContain('section "Notes"');
-    expect(submittedOps).toHaveLength(2);
+    expect(submittedOps).toHaveLength(1);
+    expect(submittedOps[0]).toHaveLength(2);
     expect(submittedOps[0]![0]!.p).toEqual([
       "itinerary",
       "sections",
@@ -109,7 +104,7 @@ describe("addNote section targeting", () => {
       0,
     ]);
     expect((submittedOps[0]![0] as { li: { type: string } }).li.type).toBe("note");
-    expect(submittedOps[1]![0]).toMatchObject({
+    expect(submittedOps[0]![1]).toMatchObject({
       p: ["itinerary", "sections", 0, "blocks", 0, "text"],
       t: "rich-text",
       o: [{ insert: "Keep passport copies here\n" }],
@@ -180,8 +175,8 @@ describe("addNote section targeting", () => {
     });
 
     expect(result.isError).toBe(true);
-    expect(result.content[0]!.text).toContain("is a dated section");
-    expect(result.content[0]!.text).toContain('"day" parameter');
+    expect(result.content[0]!.text).toMatch(/points to a trip day/i);
+    expect(result.content[0]!.text).toMatch(/day parameter/i);
     expect(submittedOps).toHaveLength(0);
   });
 

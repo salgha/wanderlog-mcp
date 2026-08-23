@@ -105,4 +105,70 @@ describe("ShareDBClient reconnect logic", () => {
     expect(consoleWarnSpy).toHaveBeenCalledTimes(1);
     expect(consoleWarnSpy.mock.calls[0]![0]).toContain("Reconnection has failed 6 times consecutively");
   });
+
+  it("reports remote ops observed while a local submit is pending", async () => {
+    const config = {
+      wsBaseUrl: "wss://test",
+      baseUrl: "https://test",
+      userAgent: "test",
+    } as any;
+    const client = new ShareDBClient(config, "tripA");
+    (client as any).subscribed = true;
+    (client as any).sessionId = "local-session";
+    (client as any)._version = 5;
+    vi.spyOn(client as any, "send").mockImplementation(() => {});
+
+    const pending = client.submit([{ p: ["title"], oi: "Local" }]);
+    (client as any).handleOpFrame({
+      a: "op",
+      c: "TripPlans",
+      d: "tripA",
+      v: 5,
+      src: "remote-session",
+      op: [{ p: ["title"], oi: "Remote" }],
+    });
+    (client as any).handleOpFrame({
+      a: "op",
+      c: "TripPlans",
+      d: "tripA",
+      v: 6,
+      src: "local-session",
+      seq: 1,
+    });
+
+    await expect(pending).resolves.toEqual({ remoteOpObserved: true });
+  });
+
+  it("advances the remote-op generation for every remote document op", () => {
+    const config = {
+      cookieHeader: "connect.sid=test",
+      wsBaseUrl: "wss://test",
+      baseUrl: "https://test",
+      userAgent: "test",
+    };
+    const client = new ShareDBClient(config, "tripA");
+    const internals = client as unknown as {
+      handleOpFrame(frame: Record<string, unknown>): void;
+    };
+
+    expect(client.remoteOpGeneration).toBe(0);
+    internals.handleOpFrame({
+      a: "op",
+      c: "TripPlans",
+      d: "tripA",
+      v: 5,
+      src: "remote-session",
+      op: [{ p: ["title"], oi: "Remote one" }],
+    });
+    internals.handleOpFrame({
+      a: "op",
+      c: "TripPlans",
+      d: "tripA",
+      v: 6,
+      src: "remote-session",
+      op: [{ p: ["title"], oi: "Remote two" }],
+    });
+
+    expect(client.remoteOpGeneration).toBe(2);
+  });
 });

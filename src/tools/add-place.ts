@@ -2,16 +2,13 @@ import { z } from "zod";
 import type { AppContext } from "../context.js";
 import { WanderlogError, WanderlogValidationError } from "../errors.js";
 import type { Json0Op } from "../ot/apply.js";
-import { resolveDay } from "../resolvers/day.js";
 import type { PlaceData } from "../types.js";
+import { resolveBlockDestination } from "../resolvers/section-target.js";
 import {
+  buildAndSubmitOp,
   buildPlaceBlock,
-  findDaySectionByDate,
-  findPlacesToVisitSection,
-  findSectionByRef,
   findTripCenter,
   requireUserId,
-  submitOp,
   validateTimeInputs,
 } from "./shared.js";
 
@@ -28,15 +25,19 @@ export const addPlaceInputSchema = {
     ),
   day: z
     .string()
+    .trim()
+    .min(1)
     .optional()
     .describe(
       "Optional day to add the place to. Accepts 'day 2', 'May 4', or ISO '2026-05-04'. Omit to add the place to the trip's 'Places to visit' list (unscheduled).",
     ),
   section: z
     .string()
+    .trim()
+    .min(1)
     .optional()
     .describe(
-      "Optional custom section to also add the place to, identified by its heading (e.g. 'Food & Drink', 'Must-See Spots'). Can be combined with 'day' to insert the place into both locations in a single call.",
+      "Optional custom place-list section identified by its heading (e.g. 'Food & Drink'). Cannot be combined with day. Duplicate headings require an ordinal such as '2nd Food'.",
     ),
   note: z
     .string()
@@ -58,7 +59,8 @@ export const addPlaceInputSchema = {
 
 export const addPlaceDescription = `
 Adds a place to a Wanderlog trip. Searches for the place near the trip's destination, picks the
-best match, and inserts it into either a specific day or the general "Places to visit" list.
+best match, and inserts it into one destination: a specific day, a named custom section, or the
+general "Places to visit" list. Day and section are mutually exclusive.
 
 PREFERRED: Use the "note" parameter to attach practical context directly to each place — transit
 directions, what to order, booking tips, time guidance. This is better than a separate
@@ -91,42 +93,9 @@ export async function addPlace(
     const entry = await ctx.tripCache.getEntry(args.trip_key);
     const trip = entry.snapshot;
 
-    // Resolve target sections. entry.snapshot is replaced after each submitOp
-    // (applyLocalOp returns a new object), so section indices are pre-computed
-    // once here — they stay stable because block inserts don't shift sections.
-    type Target = { sectionIndex: number; label: string };
-    const targets: Target[] = [];
-
-    if (args.day) {
-      const daySection = resolveDay(trip, args.day);
-      const found = findDaySectionByDate(trip, daySection.date!);
-      if (!found) {
-        throw new WanderlogValidationError(`Day ${args.day} not found in trip`);
-      }
-      targets.push({ sectionIndex: found.index, label: `day ${daySection.date}` });
-    }
-
-    if (args.section) {
-      const found = findSectionByRef(trip, args.section);
-      if (!found) {
-        throw new WanderlogValidationError(
-          `Section "${args.section}" not found in trip "${trip.title}". Use wanderlog_get_trip to see available sections.`,
-        );
-      }
-      targets.push({ sectionIndex: found.index, label: `section "${args.section}"` });
-    }
-
-    if (targets.length === 0) {
-      const places = findPlacesToVisitSection(trip);
-      if (!places) {
-        throw new WanderlogError(
-          "Trip has no 'Places to visit' list",
-          "no_places_section",
-          "This is unexpected — Wanderlog usually creates one automatically. Try adding to a specific day instead.",
-        );
-      }
-      targets.push({ sectionIndex: places.index, label: "places to visit" });
-    }
+    // Validate the requested destination before making external place lookups.
+    // It is resolved again after those lookups because section indices can shift.
+    resolveBlockDestination(trip, { day: args.day, section: args.section }, "place");
 
     const center = findTripCenter(trip, entry.geos);
     if (!center) {
@@ -158,45 +127,39 @@ export async function addPlace(
     const detail: PlaceData = await ctx.rest.getPlaceDetails(topPrediction.place_id);
     const imageKeys = await ctx.rest.getPlacePhotos(detail);
 
-    // Insert the place into each target. entry.snapshot is read fresh each
-    // iteration so blocks.length is accurate even when both targets are the
-    // same section (second block must go at N+1, not N).
-    for (const target of targets) {
-      const currentSnapshot = entry.snapshot;
-      const insertIndex = currentSnapshot.itinerary.sections[target.sectionIndex]!.blocks.length;
-      const blockPath = ["itinerary", "sections", target.sectionIndex, "blocks", insertIndex];
+    const block = buildPlaceBlock(detail, userId);
+    const destination = await buildAndSubmitOp(ctx, args.trip_key, (currentTrip) => {
+      const target = resolveBlockDestination(currentTrip, {
+        day: args.day,
+        section: args.section,
+      }, "place");
+      const insertIndex = target.section.blocks.length;
+      const blockPath = ["itinerary", "sections", target.index, "blocks", insertIndex];
+      const ops: Json0Op[] = [{ p: blockPath, li: block }];
 
-      // Build the block WITHOUT timing — timing is set via separate oi ops
-      // to match the Wanderlog UI's two-step pattern (insert block, then set fields).
-      const block = buildPlaceBlock(detail, userId);
-      const insertOps: Json0Op[] = [{ p: blockPath, li: block }];
-      // iOS/iPadOS native apps render thumbnails strictly from `imageKeys`.
-      // Submit together with the `li` so no client ever sees a keyless block.
       if (imageKeys.length > 0) {
-        insertOps.push({ p: [...blockPath, "imageKeys"], oi: imageKeys });
+        ops.push({ p: [...blockPath, "imageKeys"], oi: imageKeys });
       }
-      await submitOp(ctx, args.trip_key, insertOps);
-
       if (args.note) {
-        await submitOp(ctx, args.trip_key, [
-          {
-            p: [...blockPath, "text"],
-            t: "rich-text",
-            o: [{ insert: `${args.note}\n` }],
-          },
-        ]);
+        ops.push({
+          p: [...blockPath, "text"],
+          t: "rich-text",
+          o: [{ insert: `${args.note}\n` }],
+        });
       }
-
-      if (args.start_time || args.end_time) {
-        const timeOps: Json0Op[] = [];
-        if (args.start_time) timeOps.push({ p: [...blockPath, "startTime"], oi: args.start_time });
-        if (args.end_time) timeOps.push({ p: [...blockPath, "endTime"], oi: args.end_time });
-        await submitOp(ctx, args.trip_key, timeOps);
+      if (args.start_time) {
+        ops.push({ p: [...blockPath, "startTime"], oi: args.start_time });
       }
-    }
+      if (args.end_time) {
+        ops.push({ p: [...blockPath, "endTime"], oi: args.end_time });
+      }
+      return {
+        ops,
+        result: { label: target.label, tripTitle: currentTrip.title },
+      };
+    });
 
-    const labelList = targets.map((t) => t.label).join(" and ");
-    const parts = [`Added ${detail.name} to ${labelList} in "${trip.title}".`];
+    const parts = [`Added ${detail.name} to ${destination.label} in "${destination.tripTitle}".`];
     if (args.start_time) {
       parts.push(`Scheduled: ${args.start_time}${args.end_time ? `–${args.end_time}` : ""}.`);
     }
