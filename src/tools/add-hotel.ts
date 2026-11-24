@@ -4,11 +4,11 @@ import { WanderlogError, WanderlogValidationError } from "../errors.js";
 import type { Json0Op } from "../ot/apply.js";
 import type { PlaceData } from "../types.js";
 import {
-  buildAndSubmitOp,
   buildPlaceBlock,
   findHotelsSection,
   findTripCenter,
   requireUserId,
+  submitOp,
 } from "./shared.js";
 
 export const addHotelInputSchema = {
@@ -56,12 +56,10 @@ export async function addHotel(
 
     const userId = requireUserId(ctx);
     const entry = await ctx.tripCache.getEntry(args.trip_key);
-    const trip = entry.snapshot;
-
-    const center = findTripCenter(trip, entry.geos);
+    const center = findTripCenter(entry.snapshot, entry.geos);
     if (!center) {
       throw new WanderlogValidationError(
-        `Cannot add hotel to "${trip.title}" because no location anchor is available`,
+        `Cannot add hotel to "${entry.snapshot.title}" because no location anchor is available`,
         "This trip has no associated geo and no existing places.",
       );
     }
@@ -74,7 +72,7 @@ export async function addHotel(
     });
     if (predictions.length === 0) {
       throw new WanderlogError(
-        `No hotel found matching "${args.hotel}" near ${trip.title}`,
+        `No hotel found matching "${args.hotel}" near ${entry.snapshot.title}`,
         "hotel_not_found",
         "Try a more specific name or check the spelling.",
       );
@@ -82,27 +80,26 @@ export async function addHotel(
     const detail: PlaceData = await ctx.rest.getPlaceDetails(predictions[0]!.place_id);
     const imageKeys = await ctx.rest.getPlacePhotos(detail);
 
-    const block = buildPlaceBlock(detail, userId, {
-      hotel: {
-        checkIn: args.check_in,
-        checkOut: args.check_out,
-        travelerNames: [],
-        confirmationNumber: null,
-      },
-    });
-
-    const title = await buildAndSubmitOp(ctx, args.trip_key, (currentTrip) => {
-      const existing = findHotelsSection(currentTrip);
+    const tripTitle = await submitOp(ctx, args.trip_key, async (lockedEntry, submit) => {
+      const trip = lockedEntry.snapshot;
+      const block = buildPlaceBlock(detail, userId, {
+        hotel: {
+          checkIn: args.check_in,
+          checkOut: args.check_out,
+          travelerNames: [],
+          confirmationNumber: null,
+        },
+      });
+      const existing = findHotelsSection(trip);
+      const sectionIndex = existing ? existing.index : Math.min(1, trip.itinerary.sections.length);
       const blockPath = existing
-        ? ["itinerary", "sections", existing.index, "blocks", existing.section.blocks.length]
-        : ["itinerary", "sections", 1, "blocks", 0];
+        ? ["itinerary", "sections", sectionIndex, "blocks", existing.section.blocks.length]
+        : ["itinerary", "sections", sectionIndex, "blocks", 0];
       const ops: Json0Op[] = existing
         ? [{ p: blockPath, li: block }]
         : [
             {
-              // Insert a new hotels section after the Notes section (index 1).
-              // The existing sections shift down by 1.
-              p: ["itinerary", "sections", 1],
+              p: ["itinerary", "sections", sectionIndex],
               li: {
                 id: Math.floor(Math.random() * 1_000_000_000),
                 type: "hotels",
@@ -119,10 +116,11 @@ export async function addHotel(
       if (imageKeys.length > 0) {
         ops.push({ p: [...blockPath, "imageKeys"], oi: imageKeys });
       }
-      return { ops, result: currentTrip.title };
+      await submit(ops);
+      return trip.title;
     });
 
-    const text = `Added ${detail.name} to "${title}" · check-in ${args.check_in} → check-out ${args.check_out}.`;
+    const text = `Added ${detail.name} to "${tripTitle}" · check-in ${args.check_in} → check-out ${args.check_out}.`;
     return { content: [{ type: "text", text }] };
   } catch (err) {
     const msg =

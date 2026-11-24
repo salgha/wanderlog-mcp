@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { ShareDBClient } from "../../src/transport/sharedb.ts";
+import { ShareDBClient, ShareDBPool } from "../../src/transport/sharedb.ts";
 import { WanderlogAuthError, WanderlogError } from "../../src/errors.ts";
 
 describe("ShareDBClient reconnect logic", () => {
@@ -24,14 +24,16 @@ describe("ShareDBClient reconnect logic", () => {
 
     const rejectErr = new WanderlogAuthError();
     const doConnectSpy = vi.spyOn(client as any, "doConnect").mockRejectedValue(rejectErr);
-    const failAllPendingSpy = vi.spyOn(client as any, "failAllPending").mockImplementation(() => {});
+    const failAllPendingSpy = vi
+      .spyOn(client as any, "failAllPending")
+      .mockImplementation(() => {});
 
     // Trigger scheduleReconnect
     (client as any).scheduleReconnect(false);
 
     // Initial reconnect is scheduled, wait for the timer to fire (delay is 1000 * 2^0 = 1000ms)
     expect((client as any).reconnectTimer).toBeDefined();
-    
+
     await vi.advanceTimersByTimeAsync(1000);
 
     // doConnect should have been called
@@ -101,74 +103,43 @@ describe("ShareDBClient reconnect logic", () => {
     (client as any).reconnectAttempts = 5;
 
     (client as any).scheduleReconnect(false);
-    
+
     expect(consoleWarnSpy).toHaveBeenCalledTimes(1);
-    expect(consoleWarnSpy.mock.calls[0]![0]).toContain("Reconnection has failed 6 times consecutively");
+    expect(consoleWarnSpy.mock.calls[0]![0]).toContain(
+      "Reconnection has failed 6 times consecutively",
+    );
+  });
+});
+
+describe("ShareDBPool eviction", () => {
+  const config = {
+    wsBaseUrl: "wss://test",
+    baseUrl: "https://test",
+    userAgent: "test",
+  } as any;
+
+  it("closes and removes the current trip client", () => {
+    const pool = new ShareDBPool(config);
+    const client = pool.get("tripA");
+    const closeSpy = vi.spyOn(client, "close");
+
+    expect(pool.evict("tripA", client)).toBe(true);
+    expect(closeSpy).toHaveBeenCalledOnce();
+    expect(pool.has("tripA")).toBe(false);
+    expect(pool.get("tripA")).not.toBe(client);
+    pool.closeAll();
   });
 
-  it("reports remote ops observed while a local submit is pending", async () => {
-    const config = {
-      wsBaseUrl: "wss://test",
-      baseUrl: "https://test",
-      userAgent: "test",
-    } as any;
-    const client = new ShareDBClient(config, "tripA");
-    (client as any).subscribed = true;
-    (client as any).sessionId = "local-session";
-    (client as any)._version = 5;
-    vi.spyOn(client as any, "send").mockImplementation(() => {});
+  it("does not evict a replacement client for a stale caller", () => {
+    const pool = new ShareDBPool(config);
+    const staleClient = pool.get("tripA");
+    pool.evict("tripA", staleClient);
+    const replacement = pool.get("tripA");
+    const closeSpy = vi.spyOn(replacement, "close");
 
-    const pending = client.submit([{ p: ["title"], oi: "Local" }]);
-    (client as any).handleOpFrame({
-      a: "op",
-      c: "TripPlans",
-      d: "tripA",
-      v: 5,
-      src: "remote-session",
-      op: [{ p: ["title"], oi: "Remote" }],
-    });
-    (client as any).handleOpFrame({
-      a: "op",
-      c: "TripPlans",
-      d: "tripA",
-      v: 6,
-      src: "local-session",
-      seq: 1,
-    });
-
-    await expect(pending).resolves.toEqual({ remoteOpObserved: true });
-  });
-
-  it("advances the remote-op generation for every remote document op", () => {
-    const config = {
-      cookieHeader: "connect.sid=test",
-      wsBaseUrl: "wss://test",
-      baseUrl: "https://test",
-      userAgent: "test",
-    };
-    const client = new ShareDBClient(config, "tripA");
-    const internals = client as unknown as {
-      handleOpFrame(frame: Record<string, unknown>): void;
-    };
-
-    expect(client.remoteOpGeneration).toBe(0);
-    internals.handleOpFrame({
-      a: "op",
-      c: "TripPlans",
-      d: "tripA",
-      v: 5,
-      src: "remote-session",
-      op: [{ p: ["title"], oi: "Remote one" }],
-    });
-    internals.handleOpFrame({
-      a: "op",
-      c: "TripPlans",
-      d: "tripA",
-      v: 6,
-      src: "remote-session",
-      op: [{ p: ["title"], oi: "Remote two" }],
-    });
-
-    expect(client.remoteOpGeneration).toBe(2);
+    expect(pool.evict("tripA", staleClient)).toBe(false);
+    expect(closeSpy).not.toHaveBeenCalled();
+    expect(pool.get("tripA")).toBe(replacement);
+    pool.closeAll();
   });
 });

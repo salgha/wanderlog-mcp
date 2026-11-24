@@ -4,10 +4,10 @@ import { WanderlogError } from "../errors.js";
 import type { RentalCarEndpoint } from "../types.js";
 import {
   buildRentalCarBlock,
-  buildAndSubmitOp,
   requireUserId,
   resolveEndpointPlace,
   sectionInsertOp,
+  submitOp,
   validateChronology,
 } from "./shared.js";
 
@@ -74,11 +74,9 @@ export async function addCarRental(
 
     const userId = requireUserId(ctx);
     const entry = await ctx.tripCache.getEntry(args.trip_key);
-    const trip = entry.snapshot;
-
     const [pickPlace, dropPlace] = await Promise.all([
-      resolveEndpointPlace(ctx, trip, entry.geos, args.pickup_location),
-      resolveEndpointPlace(ctx, trip, entry.geos, args.dropoff_location),
+      resolveEndpointPlace(ctx, entry.snapshot, entry.geos, args.pickup_location),
+      resolveEndpointPlace(ctx, entry.snapshot, entry.geos, args.dropoff_location),
     ]);
 
     const pickUp: RentalCarEndpoint = {
@@ -92,19 +90,18 @@ export async function addCarRental(
       place: dropPlace,
     };
 
-    const block = buildRentalCarBlock(userId, {
-      pickUp,
-      dropOff,
-      confirmationNumber: args.confirmation_number,
-      notes: args.notes,
+    const tripTitle = await submitOp(ctx, args.trip_key, async (lockedEntry, submit) => {
+      const block = buildRentalCarBlock(userId, {
+        pickUp,
+        dropOff,
+        confirmationNumber: args.confirmation_number,
+        notes: args.notes,
+      });
+      await submit([sectionInsertOp(lockedEntry.snapshot, "rentalCars", block)]);
+      return lockedEntry.snapshot.title;
     });
 
-    const title = await buildAndSubmitOp(ctx, args.trip_key, (currentTrip) => ({
-      ops: [sectionInsertOp(currentTrip, "rentalCars", block)],
-      result: currentTrip.title,
-    }));
-
-    const text = `Added rental car to "${title}" · pick-up ${pickPlace.name} ${args.pickup_date} ${args.pickup_time} → drop-off ${dropPlace.name} ${args.dropoff_date} ${args.dropoff_time}.`;
+    const text = `Added rental car to "${tripTitle}" · pick-up ${pickPlace.name} ${args.pickup_date} ${args.pickup_time} → drop-off ${dropPlace.name} ${args.dropoff_date} ${args.dropoff_time}.`;
     return { content: [{ type: "text", text }] };
   } catch (err) {
     const msg =

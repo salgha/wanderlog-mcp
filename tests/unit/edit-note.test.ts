@@ -1,11 +1,8 @@
 import { describe, expect, it } from "vitest";
 import type { AppContext } from "../../src/context.ts";
-import type { Json0Op } from "../../src/ot/apply.ts";
+import { applyOp, type Json0Op } from "../../src/ot/apply.ts";
 import type { TripPlan } from "../../src/types.ts";
-import {
-  editNote,
-  findEditTargets,
-} from "../../src/tools/edit-note.ts";
+import { editNote, findEditTargets } from "../../src/tools/edit-note.ts";
 import { checklistTrip } from "../fixtures/checklist-trip.ts";
 import { mixedBlocksTrip } from "../fixtures/mixed-blocks-trip.ts";
 
@@ -20,6 +17,7 @@ function makeFakeContext(trip: TripPlan): {
 } {
   const submittedOps: Json0Op[][] = [];
   const invalidateCount = { value: 0 };
+  const entry = { snapshot: structuredClone(trip), version: 1, geos: [] };
 
   const ctx = {
     pool: {
@@ -32,9 +30,12 @@ function makeFakeContext(trip: TripPlan): {
       }),
     },
     tripCache: {
-      get: async () => structuredClone(trip),
-      getEntry: async () => ({ snapshot: structuredClone(trip), version: 1, geos: [] }),
-      applyLocalOp: () => {},
+      get: async () => entry.snapshot,
+      getEntry: async () => entry,
+      applyLocalOp: (_key: string, ops: Json0Op[], version: number) => {
+        entry.snapshot = applyOp(entry.snapshot, ops);
+        entry.version = version;
+      },
       invalidate: () => {
         invalidateCount.value++;
       },
@@ -108,9 +109,9 @@ describe("findEditTargets — note blocks", () => {
 
   it("filters by day", () => {
     const trip = fresh(checklistTrip);
-    const onDay1 = findEditTargets(trip, "sunscreen", { day: "day 1" });
+    const onDay1 = findEditTargets(trip, "sunscreen", "day 1");
     expect(onDay1).toHaveLength(1);
-    const onDay2 = findEditTargets(trip, "sunscreen", { day: "day 2" });
+    const onDay2 = findEditTargets(trip, "sunscreen", "day 2");
     expect(onDay2).toHaveLength(0);
   });
 });
@@ -332,9 +333,7 @@ describe("editNote", () => {
             mode: "dayPlan",
             heading: "",
             date: "2026-06-01",
-            blocks: [
-              { id: 10, type: "note", text: { ops: [{ insert: "Please book early.\n" }] } },
-            ],
+            blocks: [{ id: 10, type: "note", text: { ops: [{ insert: "Please book early.\n" }] } }],
           },
         ],
       },

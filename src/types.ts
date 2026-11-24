@@ -28,7 +28,8 @@ export type HotelBooking = {
 /** Quill-style rich text used for notes and place descriptions. */
 export type QuillDelta = {
   ops?: Array<{
-    insert?: string;
+    /** A string for text, or an object for an embed such as an image. */
+    insert?: string | Record<string, unknown>;
     attributes?: { link?: string; [k: string]: unknown };
   }>;
 };
@@ -165,13 +166,7 @@ export function isRentalCarBlock(block: Block): block is RentalCarBlock {
 }
 
 export type SectionType =
-  | "textOnly"
-  | "normal"
-  | "hotels"
-  | "flights"
-  | "transit"
-  | "rentalCars"
-  | string;
+  "textOnly" | "normal" | "hotels" | "flights" | "transit" | "rentalCars" | string;
 
 export type Section = {
   id: number;

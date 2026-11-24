@@ -2,33 +2,22 @@ import { z } from "zod";
 import type { AppContext } from "../context.js";
 import { WanderlogError, WanderlogNotFoundError } from "../errors.js";
 import type { Json0Op } from "../ot/apply.js";
-import {
-  resolveSectionScope,
-  type SectionSelector,
-} from "../resolvers/section-target.js";
+import { resolveDay } from "../resolvers/day.js";
 import type { ChecklistBlock, NoteBlock, QuillDelta, TripPlan } from "../types.js";
 import { isChecklistBlock, isPlaceBlock } from "../types.js";
-import { buildAndSubmitOp } from "./shared.js";
+import { findDaySectionByDate, submitOp } from "./shared.js";
 import { extractDeltaText } from "./remove-note.js";
 
 export const editNoteInputSchema = {
   trip_key: z.string().min(1).describe("The trip to edit."),
-  old_text: z
-    .string()
-    .min(1)
-    .describe("Substring to find and replace (case-insensitive)."),
+  old_text: z.string().min(1).describe("Substring to find and replace (case-insensitive)."),
   new_text: z.string().describe("Replacement text."),
   day: z
     .string()
-    .trim()
-    .min(1)
     .optional()
     .describe(
       "Optional day to search. Accepts 'day 2', 'May 4', or ISO '2026-05-04'. Omit to search the entire trip.",
     ),
-  section: z.string().trim().min(1).optional().describe(
-    "Optional named section to search. Cannot be combined with day.",
-  ),
 };
 
 export const editNoteDescription = `
@@ -39,8 +28,7 @@ The match is case-insensitive. If exactly one match is found, the replacement is
 If no matches are found, an error is returned. If multiple matches are found, a numbered list
 of previews is returned — call again with a more specific substring.
 
-Use the optional 'day' or 'section' filter to limit the search to one itinerary section.
-The two filters are mutually exclusive.
+Use the optional 'day' filter to limit the search to a specific day.
 `.trim();
 
 type Args = {
@@ -48,12 +36,7 @@ type Args = {
   old_text: string;
   new_text: string;
   day?: string;
-  section?: string;
 };
-
-type EditNoteResult =
-  | { kind: "error"; text: string }
-  | { kind: "success"; label: string; title: string };
 
 type RichTextTarget = {
   kind: "rich-text";
@@ -106,15 +89,20 @@ function matchInDelta(
   return { offset: matchStart, matchedLen: lowerQuery.length, crossesBoundary };
 }
 
-export function findEditTargets(
-  trip: TripPlan,
-  query: string,
-  selector: SectionSelector = {},
-): EditTarget[] {
+export function findEditTargets(trip: TripPlan, query: string, day?: string): EditTarget[] {
   const sections = trip.itinerary.sections;
   const targets: EditTarget[] = [];
   const lowerQuery = query.toLowerCase();
-  const sectionIndices = resolveSectionScope(trip, selector).indices;
+
+  let sectionIndices: number[];
+  if (day) {
+    const resolved = resolveDay(trip, day);
+    const found = findDaySectionByDate(trip, resolved.date!);
+    if (!found) return [];
+    sectionIndices = [found.index];
+  } else {
+    sectionIndices = Array.from({ length: sections.length }, (_, i) => i);
+  }
 
   for (const si of sectionIndices) {
     const section = sections[si]!;
@@ -204,35 +192,44 @@ export async function editNote(
   args: Args,
 ): Promise<{ content: Array<{ type: "text"; text: string }>; isError?: boolean }> {
   try {
-    const result = await buildAndSubmitOp<EditNoteResult>(ctx, args.trip_key, (trip) => {
-      const targets = findEditTargets(trip, args.old_text, args);
-      if (targets.length === 0) throw new WanderlogNotFoundError("Note", args.old_text);
-
+    const result = await submitOp(ctx, args.trip_key, async (entry, submit) => {
+      const trip = entry.snapshot;
+      const targets = findEditTargets(trip, args.old_text, args.day);
+      if (targets.length === 0) {
+        throw new WanderlogNotFoundError("Note", args.old_text);
+      }
       if (targets.length > 1) {
-        const lines = targets.slice(0, 5).map((target, index) =>
-          `  ${index + 1}. ${target.preview}`,
-        ).join("\n");
+        const lines = targets
+          .slice(0, 5)
+          .map((target, index) => `  ${index + 1}. ${target.preview}`)
+          .join("\n");
         const suffix = targets.length > 5 ? `\n  (${targets.length - 5} more…)` : "";
         return {
-          ops: [],
-          result: {
-            kind: "error" as const,
-            text: `"${args.old_text}" matches ${targets.length} notes:\n${lines}${suffix}\n\nCall again with a more specific substring or section scope.`,
+          response: {
+            content: [
+              {
+                type: "text" as const,
+                text: `"${args.old_text}" matches ${targets.length} notes:\n${lines}${suffix}\n\nCall again with a more specific substring to identify the one you want.`,
+              },
+            ],
+            isError: true,
           },
         };
       }
-
       const target = targets[0]!;
       if (target.kind === "rich-text" && target.crossesBoundary) {
         return {
-          ops: [],
-          result: {
-            kind: "error" as const,
-            text: `Cannot replace "${args.old_text}": the match crosses a formatting boundary (e.g. a link or bold section). Use a more specific substring that stays within one formatting run.`,
+          response: {
+            content: [
+              {
+                type: "text" as const,
+                text: `Cannot replace "${args.old_text}": the match crosses a formatting boundary (e.g. a link or bold section). Use a more specific substring that stays within one formatting run.`,
+              },
+            ],
+            isError: true,
           },
         };
       }
-
       let ops: Json0Op[];
       if (target.kind === "rich-text") {
         const deltaOps: Array<Record<string, unknown>> = [];
@@ -247,27 +244,26 @@ export async function editNote(
           target.oldValue.slice(target.offset + target.matchedLen);
         ops = [{ p: target.fieldPath, od: target.oldValue, oi: newValue }];
       }
-      return {
-        ops,
-        result: { kind: "success" as const, label: target.label, title: trip.title },
-      };
+      await submit(ops);
+      return { targetLabel: target.label, tripTitle: trip.title };
     });
+    if ("response" in result && result.response) return result.response;
 
-    if (result.kind === "error") {
-      return { content: [{ type: "text", text: result.text }], isError: true };
-    }
     const oldPreview = previewText(args.old_text);
     const newPreview = previewText(args.new_text || "(empty)");
     return {
-      content: [{
-        type: "text",
-        text: `Updated ${result.label} in "${result.title}". Changed "${oldPreview}" → "${newPreview}".`,
-      }],
+      content: [
+        {
+          type: "text",
+          text: `Updated ${result.targetLabel} in "${result.tripTitle}". Changed "${oldPreview}" → "${newPreview}".`,
+        },
+      ],
     };
   } catch (err) {
-    const msg = err instanceof WanderlogError
-      ? err.toUserMessage()
-      : `Unexpected error: ${(err as Error).message}`;
+    const msg =
+      err instanceof WanderlogError
+        ? err.toUserMessage()
+        : `Unexpected error: ${(err as Error).message}`;
     return { content: [{ type: "text", text: msg }], isError: true };
   }
 }

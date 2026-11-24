@@ -1,12 +1,8 @@
 import { describe, expect, it } from "vitest";
 import type { AppContext } from "../../src/context.ts";
-import type { Json0Op } from "../../src/ot/apply.ts";
+import { applyOp, type Json0Op } from "../../src/ot/apply.ts";
 import type { TripPlan } from "../../src/types.ts";
-import {
-  extractPlainText,
-  findNoteMatches,
-  removeNote,
-} from "../../src/tools/remove-note.ts";
+import { extractPlainText, findNoteMatches, removeNote } from "../../src/tools/remove-note.ts";
 import { checklistTrip } from "../fixtures/checklist-trip.ts";
 import { mixedBlocksTrip } from "../fixtures/mixed-blocks-trip.ts";
 
@@ -21,6 +17,7 @@ function makeFakeContext(trip: TripPlan): {
 } {
   const submittedOps: Json0Op[][] = [];
   const invalidateCount = { value: 0 };
+  const entry = { snapshot: structuredClone(trip), version: 1, geos: [] };
 
   const ctx = {
     pool: {
@@ -33,9 +30,12 @@ function makeFakeContext(trip: TripPlan): {
       }),
     },
     tripCache: {
-      get: async () => structuredClone(trip),
-      getEntry: async () => ({ snapshot: structuredClone(trip), version: 1, geos: [] }),
-      applyLocalOp: () => {},
+      get: async () => entry.snapshot,
+      getEntry: async () => entry,
+      applyLocalOp: (_key: string, ops: Json0Op[], version: number) => {
+        entry.snapshot = applyOp(entry.snapshot, ops);
+        entry.version = version;
+      },
       invalidate: () => {
         invalidateCount.value++;
       },
@@ -148,10 +148,10 @@ describe("findNoteMatches", () => {
   it("filters by day when day is specified", () => {
     const trip = fresh(checklistTrip);
     // The sunscreen note is on 2026-06-01 (day 1)
-    const onDay1 = findNoteMatches(trip, "sunscreen", { day: "day 1" });
+    const onDay1 = findNoteMatches(trip, "sunscreen", "day 1");
     expect(onDay1).toHaveLength(1);
 
-    const onDay2 = findNoteMatches(trip, "sunscreen", { day: "day 2" });
+    const onDay2 = findNoteMatches(trip, "sunscreen", "day 2");
     expect(onDay2).toHaveLength(0);
   });
 

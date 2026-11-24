@@ -1,14 +1,14 @@
 import type { AppContext } from "../context.js";
+import type { CacheEntry } from "../cache/trip-cache.js";
 import { WanderlogError, WanderlogValidationError } from "../errors.js";
 import type { Json0Op } from "../ot/apply.js";
-import type { SubmitOutcome } from "../transport/sharedb.js";
-import { resolveSectionRef } from "../resolvers/section-ref.js";
-import { resolveBlockDestination } from "../resolvers/section-target.js";
+import { resolveDay } from "../resolvers/day.js";
 import type {
   Block,
   ChecklistItem,
   Geo,
   PlaceData,
+  QuillDelta,
   RentalCarEndpoint,
   Section,
   TransitEndpoint,
@@ -24,129 +24,96 @@ import { isPlaceBlock } from "../types.js";
  */
 const submitLocks = new Map<string, Promise<unknown>>();
 
-/** Test-only visibility for lock-lifecycle regression coverage. */
-export function submitLockCountForTests(): number {
-  return submitLocks.size;
-}
-
-async function withSubmitLock<T>(
-  tripKey: string,
-  fn: () => Promise<T>,
-): Promise<T> {
+async function withSubmitLock<T>(tripKey: string, fn: () => Promise<T>): Promise<T> {
   const prev = submitLocks.get(tripKey) ?? Promise.resolve();
   // Chain regardless of whether the previous op succeeded or failed —
   // one failed op should not permanently block the queue.
   const next = prev.then(fn, fn);
-  const tail = next.catch(() => {});
-  submitLocks.set(tripKey, tail);
-  void tail.then(() => {
-    // A newer queued call may have replaced this tail while it was pending.
-    if (submitLocks.get(tripKey) === tail) submitLocks.delete(tripKey);
-  });
+  // The map always holds a never-rejecting tail so the next caller can chain
+  // onto it safely. Dead promises are negligible; the map is keyed by trip.
+  submitLocks.set(
+    tripKey,
+    next.catch(() => {}),
+  );
   return next;
 }
 
 /**
- * Submit a JSON0 op array to the server and apply it to the live cache on
- * success. Encapsulates the version handshake so tools don't touch
- * ShareDBClient directly.
+ * Run a mutation transaction against a fresh cache entry while holding the
+ * per-trip lock. The callback resolves targets and constructs paths from the
+ * locked snapshot, then uses `submit` for one or more batches.
  *
  * Rules:
- * - Trip must already be in the cache (caller should have called tripCache.get()).
  * - Per-trip mutex: concurrent calls on the same trip serialize automatically.
- * - Op fails atomically: if submit rejects, the cache is invalidated so the
- *   next read refetches a fresh snapshot from the server.
- * - On success, cache.applyLocalOp() is called with the server-accepted version.
+ * - Each successful batch is applied to the stable entry before `submit` returns.
+ * - Ambiguous submit failures and local apply failures invalidate the cache.
+ * - Confirmed server rejections and callback errors leave the cache intact.
  */
-export async function submitOp(
+export async function submitOp<T>(
   ctx: AppContext,
   tripKey: string,
-  ops: Json0Op[],
-): Promise<void> {
-  return withSubmitLock(tripKey, async () => {
-    await submitLocked(ctx, tripKey, ops);
-  });
-}
-
-export async function buildAndSubmitOp<T>(
-  ctx: AppContext,
-  tripKey: string,
-  build: (trip: TripPlan) => { ops: Json0Op[]; result: T },
+  mutate: (entry: CacheEntry, submit: (ops: Json0Op[]) => Promise<void>) => Promise<T> | T,
 ): Promise<T> {
   return withSubmitLock(tripKey, async () => {
     const entry = await ctx.tripCache.getEntry(tripKey);
-    const { ops, result } = build(entry.snapshot);
-    if (ops.length > 0) await submitLocked(ctx, tripKey, ops);
-    return result;
+    const client = ctx.pool.get(tripKey);
+    const submit = async (ops: Json0Op[]): Promise<void> => {
+      try {
+        if (!client.isSubscribed) {
+          throw new WanderlogError(`Trip ${tripKey} is not subscribed`, "not_subscribed");
+        }
+        await submitWithRateLimitRetry(client, ops);
+      } catch (err) {
+        if (!isConfirmedNonApplication(err)) {
+          ctx.tripCache.invalidate(tripKey);
+        }
+        throw err;
+      }
+
+      try {
+        ctx.tripCache.applyLocalOp(tripKey, ops, client.version);
+      } catch (err) {
+        ctx.tripCache.invalidate(tripKey);
+        throw err;
+      }
+    };
+
+    return mutate(entry, submit);
   });
 }
 
-async function submitLocked(
-  ctx: AppContext,
-  tripKey: string,
-  ops: Json0Op[],
-): Promise<void> {
-  const client = ctx.pool.get(tripKey);
-  if (!client.isSubscribed) {
-    throw new WanderlogError(
-      `Trip ${tripKey} is not subscribed — call tripCache.get() first`,
-      "not_subscribed",
-    );
-  }
-  try {
-    const outcome = await submitWithRateLimitRetry(client, ops);
-    if (outcome?.remoteOpObserved) {
-      // The server may have transformed our op against the remote change. Since
-      // the ack does not include that transformed op, discard the cache only
-      // after the ack and rebuild it from a fresh subscription on the next read.
-      ctx.tripCache.invalidate(tripKey);
-      return;
-    }
-    ctx.tripCache.applyLocalOp(tripKey, ops, client.version);
-  } catch (err) {
-    // Any submit failure leaves our cached view possibly inconsistent with
-    // the server. Invalidate so the next get() refetches + resubscribes.
-    ctx.tripCache.invalidate(tripKey);
-    throw err;
-  }
+const CONFIRMED_NON_APPLICATION_CODES = new Set([
+  "empty_op",
+  "rate_limited",
+  "ws_not_open",
+  "ws_op_rejected",
+]);
+
+function isConfirmedNonApplication(err: unknown): boolean {
+  return err instanceof WanderlogError && CONFIRMED_NON_APPLICATION_CODES.has(err.code);
 }
 
 const RATE_LIMIT_RETRY_DELAYS_MS = [2_000, 4_000, 8_000];
 
-// A rate-limited op (code 4001) is rejected before the server processes it.
-// Resubmission is safe only while no remote op has advanced the subscribed
-// document; otherwise the caller must discard and rebuild from a fresh snapshot.
+// A rate-limited op (code 4001) is rejected before the server processes it —
+// it never acks and never applies — so resubmitting the same ops at the same
+// version is safe. Burst mutations (e.g. an LLM building a full itinerary)
+// hit the limit routinely; waiting out the window beats surfacing an error.
 async function submitWithRateLimitRetry(
-  client: {
-    remoteOpGeneration: number;
-    submit(ops: Json0Op[]): Promise<SubmitOutcome | void>;
-  },
+  client: { submit(ops: Json0Op[]): Promise<void> },
   ops: Json0Op[],
-): Promise<SubmitOutcome | void> {
-  const startingRemoteOpGeneration = client.remoteOpGeneration;
-  const assertRetryIsFresh = () => {
-    if (client.remoteOpGeneration !== startingRemoteOpGeneration) {
-      throw new WanderlogError(
-        "Cannot retry the rate-limited operation because the remote document advanced",
-        "stale_rate_limit_retry",
-      );
-    }
-  };
+): Promise<void> {
   let attempt = 0;
   for (;;) {
     try {
-      return await client.submit(ops);
+      await client.submit(ops);
+      return;
     } catch (err) {
-      const isRateLimit =
-        err instanceof WanderlogError && err.code === "rate_limited";
+      const isRateLimit = err instanceof WanderlogError && err.code === "rate_limited";
       if (!isRateLimit || attempt >= RATE_LIMIT_RETRY_DELAYS_MS.length) {
         throw err;
       }
-      assertRetryIsFresh();
-      await new Promise((r) =>
-        setTimeout(r, RATE_LIMIT_RETRY_DELAYS_MS[attempt]),
-      );
-      assertRetryIsFresh();
+      await new Promise((r) => setTimeout(r, RATE_LIMIT_RETRY_DELAYS_MS[attempt]));
       attempt += 1;
     }
   }
@@ -186,16 +153,95 @@ export function findSectionByRef(
   trip: TripPlan,
   ref: string,
 ): { index: number; section: Section } | null {
-  const result = resolveSectionRef(trip, ref);
-  return result.kind === "unique" ? result.match : null;
+  const resolved = resolveSectionRef(trip, ref);
+  return resolved.kind === "unique" ? resolved.match : null;
+}
+
+export type SectionMatch = { index: number; section: Section };
+
+export type SectionRefResult =
+  | { kind: "unique"; match: SectionMatch }
+  | { kind: "ambiguous"; candidates: SectionMatch[] }
+  | { kind: "none" };
+
+/**
+ * Resolve a section heading without silently picking the first duplicate.
+ * The default list aliases remain unambiguous because they resolve by section
+ * identity instead of heading. All other headings return every match so
+ * mutation tools can fail safely when a trip contains duplicate list names.
+ */
+export function resolveSectionRef(trip: TripPlan, ref: string): SectionRefResult {
+  const normalized = ref.trim().toLowerCase();
+  if (normalized === "places to visit" || normalized === "places") {
+    const found = findPlacesToVisitSection(trip);
+    return found ? { kind: "unique", match: found } : { kind: "none" };
+  }
+
+  const candidates: SectionMatch[] = [];
+  for (let i = 0; i < trip.itinerary.sections.length; i++) {
+    const section = trip.itinerary.sections[i]!;
+    if (section.heading.trim().toLowerCase() === normalized) {
+      candidates.push({ index: i, section });
+    }
+  }
+  if (candidates.length === 0) return { kind: "none" };
+  if (candidates.length === 1) return { kind: "unique", match: candidates[0]! };
+  return { kind: "ambiguous", candidates };
+}
+
+const SYSTEM_SECTION_TYPES = new Set(["hotels", "flights", "transit", "rentalCars"]);
+
+export function isSystemSection(section: Section): boolean {
+  return SYSTEM_SECTION_TYPES.has(section.type);
+}
+
+/** Custom undated lists that users may rename, delete, or reorder. */
+export function isCustomSection(trip: TripPlan, index: number): boolean {
+  const section = trip.itinerary.sections[index];
+  if (!section || section.mode === "dayPlan" || isSystemSection(section)) return false;
+  return findPlacesToVisitSection(trip)?.index !== index;
+}
+
+export function describeSection(section: Section): string {
+  if (section.mode === "dayPlan" && section.date) return `day ${section.date}`;
+  return `section "${section.heading || "(untitled)"}"`;
+}
+
+export function findBlockById(
+  trip: TripPlan,
+  blockId: number,
+): { sectionIndex: number; blockIndex: number; section: Section; block: Block } | null {
+  for (let sectionIndex = 0; sectionIndex < trip.itinerary.sections.length; sectionIndex++) {
+    const section = trip.itinerary.sections[sectionIndex]!;
+    const blockIndex = section.blocks.findIndex((block) => block.id === blockId);
+    if (blockIndex >= 0) {
+      return {
+        sectionIndex,
+        blockIndex,
+        section,
+        block: section.blocks[blockIndex]!,
+      };
+    }
+  }
+  return null;
+}
+
+export function assertBlockAtPath(
+  trip: TripPlan,
+  sectionIndex: number,
+  blockIndex: number,
+  blockId: number,
+): Block {
+  const block = trip.itinerary.sections[sectionIndex]?.blocks[blockIndex];
+  if (!block || block.id !== blockId) {
+    throw new WanderlogError(`Block ${blockId} moved while preparing the mutation`, "stale_target");
+  }
+  return block;
 }
 
 export function requireUserId(ctx: AppContext): number {
   if (ctx.userId == null) {
-    throw new WanderlogError(
-      "User ID not available — auth probe has not completed",
-      "no_user_id",
-    );
+    throw new WanderlogError("User ID not available — auth probe has not completed", "no_user_id");
   }
   return ctx.userId;
 }
@@ -298,10 +344,7 @@ export function findDaySectionByDate(
  *   2. The trip's first associated geo (from /api/tripPlans/{key} resources)
  *   3. Null if both are absent
  */
-export function findTripCenter(
-  trip: TripPlan,
-  geos?: Geo[],
-): { lat: number; lng: number } | null {
+export function findTripCenter(trip: TripPlan, geos?: Geo[]): { lat: number; lng: number } | null {
   for (const section of trip.itinerary.sections) {
     for (const block of section.blocks) {
       if (!isPlaceBlock(block)) continue;
@@ -318,11 +361,62 @@ export function findTripCenter(
  * Resolves the target section for adding a block — either a specific day
  * or the "Places to visit" list. Shared by add-place, add-note, add-checklist.
  */
-export function findTargetSection(
+export type TargetSection = {
+  index: number;
+  section: Section;
+  label: string;
+};
+
+export function findTargetSection(trip: TripPlan, day?: string): TargetSection {
+  if (day) {
+    const daySection = resolveDay(trip, day);
+    const found = findDaySectionByDate(trip, daySection.date!);
+    if (!found) {
+      throw new WanderlogValidationError(`Day ${day} not found in trip`);
+    }
+    return { index: found.index, section: found.section, label: `day ${daySection.date}` };
+  }
+  const places = findPlacesToVisitSection(trip);
+  if (!places) {
+    throw new WanderlogError(
+      "Trip has no 'Places to visit' list",
+      "no_places_section",
+      "This is unexpected — Wanderlog usually creates one automatically. Try adding to a specific day instead.",
+    );
+  }
+  return { index: places.index, section: places.section, label: "places to visit" };
+}
+
+/**
+ * Resolves a block target when callers support both dated days and named
+ * undated sections. A named section takes precedence over a day, matching the
+ * public add-note/add-checklist contract.
+ */
+export function findBlockTargetSection(
   trip: TripPlan,
-  day?: string,
-): { index: number; section: Section; label: string } {
-  return resolveBlockDestination(trip, { day }, "note");
+  target: { day?: string; section?: string },
+  blockLabel: string,
+): TargetSection {
+  if (target.section !== undefined) {
+    const found = findSectionByRef(trip, target.section);
+    if (!found) {
+      throw new WanderlogValidationError(
+        `Section "${target.section}" not found in trip "${trip.title}". Use wanderlog_get_trip to see available sections.`,
+      );
+    }
+    if (found.section.mode === "dayPlan") {
+      throw new WanderlogValidationError(
+        `Section "${found.section.heading || target.section}" is a dated section. Use the "day" parameter to add a ${blockLabel} to an itinerary day.`,
+      );
+    }
+    return {
+      index: found.index,
+      section: found.section,
+      label: `section "${found.section.heading || target.section}"`,
+    };
+  }
+
+  return findTargetSection(trip, target.day);
 }
 
 /** Build a note block matching the shape captured from the Wanderlog UI. */
@@ -546,9 +640,7 @@ export function isValidDate(dateStr: string): boolean {
   const [year, month, day] = dateStr.split("-").map((s) => parseInt(s, 10));
   const date = new Date(Date.UTC(year!, month! - 1, day!));
   return (
-    date.getUTCFullYear() === year &&
-    date.getUTCMonth() === month! - 1 &&
-    date.getUTCDate() === day
+    date.getUTCFullYear() === year && date.getUTCMonth() === month! - 1 && date.getUTCDate() === day
   );
 }
 
@@ -560,4 +652,39 @@ export function validateDateRange(startDate: string, endDate: string): void {
       `end_date (${endDate}) must be on or after start_date (${startDate}).`,
     );
   }
+}
+
+/**
+ * Length in Quill units, where an embed counts as one. Sizing a delete off the
+ * plain text instead leaves part of the old note behind when it holds an image.
+ */
+export function quillLength(delta: QuillDelta | undefined): number {
+  return (delta?.ops ?? []).reduce((total, op) => {
+    if (typeof op.insert === "string") return total + op.insert.length;
+    return op.insert === undefined ? total : total + 1;
+  }, 0);
+}
+
+export function normalizeNote(note: string): string {
+  return note.replace(/\n+$/, "");
+}
+
+/**
+ * A bare `insert` inserts at offset 0 rather than replacing, so the existing
+ * note has to be deleted explicitly. The document's trailing newline is kept
+ * and the replacement goes in ahead of it.
+ */
+export function buildNoteReplaceDelta(
+  existing: QuillDelta | undefined,
+  note: string,
+): Array<Record<string, unknown>> {
+  const lastInsert = existing?.ops?.at(-1)?.insert;
+  const keepsTerminator = typeof lastInsert === "string" && lastInsert.endsWith("\n");
+  const deleteLen = quillLength(existing) - (keepsTerminator ? 1 : 0);
+  const body = normalizeNote(note);
+
+  const ops: Array<Record<string, unknown>> = [];
+  if (deleteLen > 0) ops.push({ delete: deleteLen });
+  ops.push({ insert: keepsTerminator ? body : `${body}\n` });
+  return ops;
 }

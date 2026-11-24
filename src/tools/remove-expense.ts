@@ -2,12 +2,8 @@ import { z } from "zod";
 import type { AppContext } from "../context.js";
 import { WanderlogError, WanderlogNotFoundError } from "../errors.js";
 import type { Json0Op } from "../ot/apply.js";
-import {
-  findExpenseMatches,
-  formatCandidateList,
-  formatExpense,
-} from "./expenses-shared.js";
-import { buildAndSubmitOp } from "./shared.js";
+import { findExpenseMatches, formatCandidateList, formatExpense } from "./expenses-shared.js";
+import { submitOp } from "./shared.js";
 
 export const removeExpenseInputSchema = {
   trip_key: z.string().min(1).describe("The trip to remove the expense from."),
@@ -54,10 +50,8 @@ export async function removeExpense(
   args: Args,
 ): Promise<{ content: Array<{ type: "text"; text: string }>; isError?: boolean }> {
   try {
-    const result = await buildAndSubmitOp<{
-      kind: "error" | "removed";
-      text: string;
-    }>(ctx, args.trip_key, (trip) => {
+    const result = await submitOp(ctx, args.trip_key, async (entry, submit) => {
+      const trip = entry.snapshot;
       const matches = findExpenseMatches(trip, {
         description: args.description,
         date: args.date,
@@ -69,31 +63,35 @@ export async function removeExpense(
       }
       if (matches.length > 1) {
         return {
-          ops: [],
-          result: {
-            kind: "error" as const,
-            text: `"${args.description}" matches ${matches.length} expenses:\n${formatCandidateList(matches)}\n\nRe-call with a more specific description, or add a date / amount / currency filter to pick one.`,
+          response: {
+            content: [
+              {
+                type: "text" as const,
+                text: `"${args.description}" matches ${matches.length} expenses:\n${formatCandidateList(matches)}\n\nRe-call with a more specific description, or add a date / amount / currency filter to pick one.`,
+              },
+            ],
+            isError: true,
           },
         };
       }
-
       const { index, expense } = matches[0]!;
-      const ops: Json0Op[] = [{
-        p: ["itinerary", "budget", "expenses", index],
-        ld: expense,
-      }];
-      return {
-        ops,
-        result: {
-          kind: "removed" as const,
-          text: `Removed expense ${formatExpense(expense)} from "${trip.title}".`,
-        },
-      };
+      const expenseId = expense.id;
+      const ops: Json0Op[] = [{ p: ["itinerary", "budget", "expenses", index], ld: expense }];
+      await submit(ops);
+      if (entry.snapshot.itinerary.budget?.expenses?.some((item) => item.id === expenseId)) {
+        throw new WanderlogError("Removed expense is still present", "stale_target");
+      }
+      return { expense, tripTitle: trip.title };
     });
+    if ("response" in result && result.response) return result.response;
 
     return {
-      content: [{ type: "text", text: result.text }],
-      ...(result.kind === "error" ? { isError: true } : {}),
+      content: [
+        {
+          type: "text",
+          text: `Removed expense ${formatExpense(result.expense)} from "${result.tripTitle}".`,
+        },
+      ],
     };
   } catch (err) {
     const msg =

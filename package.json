@@ -1,6 +1,6 @@
 {
   "name": "wanderlog-mcp",
-  "version": "0.4.0",
+  "version": "0.3.2",
   "description": "MCP server for Wanderlog — let Claude build and edit your trip itineraries through conversation",
   "type": "module",
   "bin": {
@@ -41,7 +41,9 @@
     "typecheck": "tsc --noEmit",
     "eval": "node --env-file=.env --import tsx evals/run.ts",
     "start:http": "node --env-file=.env dist/http.js",
-    "lint": "eslint ."
+    "lint": "eslint .",
+    "format": "prettier --write .",
+    "format:check": "prettier --check ."
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",
@@ -49,16 +51,17 @@
     "zod": "^4.4.3"
   },
   "devDependencies": {
-    "@anthropic-ai/sdk": "^0.116.0",
+    "@anthropic-ai/sdk": "^0.128.0",
     "@eslint/js": "^10.0.1",
     "@types/node": "^22.10.2",
     "@types/ws": "^8.5.13",
-    "@vitest/coverage-v8": "^4.1.10",
+    "@vitest/coverage-v8": "^5.0.2",
     "eslint": "^10.5.0",
     "globals": "^17.7.0",
+    "prettier": "^3.9.9",
     "tsx": "^4.23.0",
     "typescript": "^6.0.3",
     "typescript-eslint": "^8.62.0",
-    "vitest": "^4.1.10"
+    "vitest": "^5.0.2"
   }
 }

@@ -1,10 +1,9 @@
 import { describe, expect, it } from "vitest";
 import type { AppContext } from "../../src/context.ts";
 import { applyOp, type Json0Op } from "../../src/ot/apply.ts";
-import {
-  buildSectionObject,
-  findSectionByRef,
-} from "../../src/tools/shared.ts";
+import { buildSectionObject, findSectionByRef } from "../../src/tools/shared.ts";
+import { addSection } from "../../src/tools/add-section.ts";
+import { deleteSection } from "../../src/tools/delete-section.ts";
 import { updateSection } from "../../src/tools/update-section.ts";
 import type { Section, TripPlan } from "../../src/types.ts";
 import { checklistTrip } from "../fixtures/checklist-trip.ts";
@@ -18,7 +17,9 @@ function makeFakeContext(trip: TripPlan): {
   submittedOps: Json0Op[][];
 } {
   const submittedOps: Json0Op[][] = [];
+  const entry = { snapshot: structuredClone(trip), version: 1, geos: [] };
   const ctx = {
+    userId: 3656632,
     pool: {
       get: () => ({
         isSubscribed: true,
@@ -29,8 +30,11 @@ function makeFakeContext(trip: TripPlan): {
       }),
     },
     tripCache: {
-      getEntry: async () => ({ snapshot: structuredClone(trip) }),
-      applyLocalOp: () => {},
+      getEntry: async () => entry,
+      applyLocalOp: (_key: string, ops: Json0Op[], version: number) => {
+        entry.snapshot = applyOp(entry.snapshot, ops);
+        entry.version = version;
+      },
       invalidate: () => {},
     },
   } as unknown as AppContext;
@@ -106,6 +110,19 @@ describe("findSectionByRef", () => {
     const trip = fresh(checklistTrip);
     expect(findSectionByRef(trip, "Nonexistent Section")).toBeNull();
   });
+
+  it("returns null instead of choosing the first duplicate heading", () => {
+    const trip = fresh(checklistTrip);
+    trip.itinerary.sections.unshift({
+      id: 99,
+      type: "textOnly",
+      mode: "placeList",
+      heading: "Notes",
+      date: null,
+      blocks: [],
+    });
+    expect(findSectionByRef(trip, "Notes")).toBeNull();
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -117,9 +134,7 @@ describe("applyOp – section li", () => {
     const doc = fresh(checklistTrip);
     const section = buildSectionObject("Day Trips");
     const insertIndex = doc.itinerary.sections.length;
-    const ops: Json0Op[] = [
-      { p: ["itinerary", "sections", insertIndex], li: section },
-    ];
+    const ops: Json0Op[] = [{ p: ["itinerary", "sections", insertIndex], li: section }];
     const next = applyOp(doc, ops);
     expect(next.itinerary.sections).toHaveLength(insertIndex + 1);
     const inserted = next.itinerary.sections[insertIndex]! as Section;
@@ -132,9 +147,7 @@ describe("applyOp – section li", () => {
   it("inserts a section at a mid-trip position", () => {
     const doc = fresh(checklistTrip);
     const section = buildSectionObject("Must-See");
-    const ops: Json0Op[] = [
-      { p: ["itinerary", "sections", 1], li: section },
-    ];
+    const ops: Json0Op[] = [{ p: ["itinerary", "sections", 1], li: section }];
     const next = applyOp(doc, ops);
     expect((next.itinerary.sections[1]! as Section).heading).toBe("Must-See");
     // Existing section at index 1 is shifted to index 2
@@ -203,9 +216,7 @@ describe("applyOp – section ld", () => {
     const sectionCount = doc.itinerary.sections.length;
     // Delete the section at index 0 ("Notes")
     const target = doc.itinerary.sections[0]!;
-    const ops: Json0Op[] = [
-      { p: ["itinerary", "sections", 0], ld: target },
-    ];
+    const ops: Json0Op[] = [{ p: ["itinerary", "sections", 0], ld: target }];
     const next = applyOp(doc, ops);
     expect(next.itinerary.sections).toHaveLength(sectionCount - 1);
     // Former index 1 ("Places to visit") is now at index 0
@@ -215,9 +226,7 @@ describe("applyOp – section ld", () => {
   it("throws when ld value does not match the existing section", () => {
     const doc = fresh(checklistTrip);
     const staleSection = { ...doc.itinerary.sections[0]!, heading: "Wrong heading" };
-    const ops: Json0Op[] = [
-      { p: ["itinerary", "sections", 0], ld: staleSection },
-    ];
+    const ops: Json0Op[] = [{ p: ["itinerary", "sections", 0], ld: staleSection }];
     expect(() => applyOp(doc, ops)).toThrow();
   });
 });
@@ -249,31 +258,89 @@ describe("updateSection guards", () => {
       heading: "My places",
     });
     expect(res.isError).toBe(true);
-    expect(res.content[0]!.text).toContain("Places to visit");
+    expect(res.content[0]!.text).toContain("default place list");
     expect(submittedOps).toHaveLength(0);
   });
 
   it("allows renaming a genuine custom section", async () => {
-    const trip = fresh(checklistTrip);
-    trip.itinerary.sections.push({
-      id: 999,
-      type: "normal",
-      mode: "placeList",
-      heading: "Food",
-      date: null,
-      blocks: [],
-    });
-    const { ctx, submittedOps } = makeFakeContext(trip);
+    const { ctx, submittedOps } = makeFakeContext(checklistTrip);
     const res = await updateSection(ctx, {
       trip_key: "T",
-      section: "Food",
+      section: "Notes",
       heading: "Trip Notes",
     });
     expect(res.isError).toBeUndefined();
     expect(submittedOps).toHaveLength(1);
     expect(submittedOps[0]![0]!).toMatchObject({
-      od: "Food",
+      od: "Notes",
       oi: "Trip Notes",
     });
+  });
+});
+
+describe("custom section lifecycle safety", () => {
+  it("creates, renames, and deletes a uniquely named custom section", async () => {
+    const { ctx } = makeFakeContext(checklistTrip);
+    const added = await addSection(ctx, {
+      trip_key: "T",
+      heading: "Sights",
+      after_section: "Notes",
+    });
+    expect(added.isError).toBeUndefined();
+
+    const renamed = await updateSection(ctx, {
+      trip_key: "T",
+      section: "Sights",
+      heading: "Must See",
+    });
+    expect(renamed.isError).toBeUndefined();
+
+    const deleted = await deleteSection(ctx, {
+      trip_key: "T",
+      section: "Must See",
+    });
+    expect(deleted.isError).toBeUndefined();
+  });
+
+  it("rejects duplicate headings on create and rename", async () => {
+    const { ctx, submittedOps } = makeFakeContext(checklistTrip);
+    const added = await addSection(ctx, { trip_key: "T", heading: "notes" });
+    expect(added.isError).toBe(true);
+
+    const renamed = await updateSection(ctx, {
+      trip_key: "T",
+      section: "Notes",
+      heading: "Places to visit",
+    });
+    expect(renamed.isError).toBe(true);
+    expect(submittedOps).toHaveLength(0);
+  });
+
+  it("rejects ambiguous and day-section delete targets", async () => {
+    const trip = fresh(checklistTrip);
+    trip.itinerary.sections.unshift({
+      id: 99,
+      type: "textOnly",
+      mode: "placeList",
+      heading: "Notes",
+      date: null,
+      blocks: [],
+    });
+    const ambiguous = makeFakeContext(trip);
+    const ambiguousResult = await deleteSection(ambiguous.ctx, {
+      trip_key: "T",
+      section: "Notes",
+    });
+    expect(ambiguousResult.isError).toBe(true);
+    expect(ambiguousResult.content[0]!.text).toContain("ambiguous");
+    expect(ambiguous.submittedOps).toHaveLength(0);
+
+    const day = makeFakeContext(checklistTrip);
+    const dayResult = await deleteSection(day.ctx, {
+      trip_key: "T",
+      section: "Arrival day",
+    });
+    expect(dayResult.isError).toBe(true);
+    expect(day.submittedOps).toHaveLength(0);
   });
 });

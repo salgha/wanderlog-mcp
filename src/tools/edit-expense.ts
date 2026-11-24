@@ -3,12 +3,8 @@ import type { AppContext } from "../context.js";
 import { WanderlogError, WanderlogNotFoundError, WanderlogValidationError } from "../errors.js";
 import type { Json0Op } from "../ot/apply.js";
 import type { Expense } from "../types.js";
-import {
-  findExpenseMatches,
-  formatCandidateList,
-  formatExpense,
-} from "./expenses-shared.js";
-import { buildAndSubmitOp } from "./shared.js";
+import { findExpenseMatches, formatCandidateList, formatExpense } from "./expenses-shared.js";
+import { submitOp } from "./shared.js";
 
 export const editExpenseInputSchema = {
   trip_key: z.string().min(1).describe("The trip whose expense to edit."),
@@ -47,7 +43,9 @@ export const editExpenseInputSchema = {
     .min(3)
     .max(3)
     .optional()
-    .describe("New ISO 4217 currency code (e.g. 'EUR'). Normalized to uppercase. Omit to leave unchanged."),
+    .describe(
+      "New ISO 4217 currency code (e.g. 'EUR'). Normalized to uppercase. Omit to leave unchanged.",
+    ),
   new_category: z
     .enum([
       "food",
@@ -97,12 +95,10 @@ type Args = {
 };
 
 /** od+oi replacement for an existing key; oi-only insert when the key is absent. */
-function replaceField(
-  path: (string | number)[],
-  oldValue: unknown,
-  newValue: unknown,
-): Json0Op {
-  return oldValue === undefined ? { p: path, oi: newValue } : { p: path, od: oldValue, oi: newValue };
+function replaceField(path: (string | number)[], oldValue: unknown, newValue: unknown): Json0Op {
+  return oldValue === undefined
+    ? { p: path, oi: newValue }
+    : { p: path, od: oldValue, oi: newValue };
 }
 
 function buildEditOps(
@@ -175,10 +171,8 @@ export async function editExpense(
       );
     }
 
-    const result = await buildAndSubmitOp<{
-      kind: "error" | "no-change" | "updated";
-      text: string;
-    }>(ctx, args.trip_key, (trip) => {
+    const result = await submitOp(ctx, args.trip_key, async (entry, submit) => {
+      const trip = entry.snapshot;
       const matches = findExpenseMatches(trip, {
         description: args.description,
         date: args.date,
@@ -190,37 +184,43 @@ export async function editExpense(
       }
       if (matches.length > 1) {
         return {
-          ops: [],
-          result: {
-            kind: "error" as const,
-            text: `"${args.description}" matches ${matches.length} expenses:\n${formatCandidateList(matches)}\n\nRe-call with a more specific description, or add a date / amount / currency filter to pick one.`,
+          response: {
+            content: [
+              {
+                type: "text" as const,
+                text: `"${args.description}" matches ${matches.length} expenses:\n${formatCandidateList(matches)}\n\nRe-call with a more specific description, or add a date / amount / currency filter to pick one.`,
+              },
+            ],
+            isError: true,
           },
         };
       }
-
       const { index, expense } = matches[0]!;
       const { ops, changes } = buildEditOps(expense, index, args);
       if (ops.length === 0) {
         return {
-          ops,
-          result: {
-            kind: "no-change" as const,
-            text: `No changes — ${formatExpense(expense)} already has those values.`,
+          response: {
+            content: [
+              {
+                type: "text" as const,
+                text: `No changes — ${formatExpense(expense)} already has those values.`,
+              },
+            ],
           },
         };
       }
-      return {
-        ops,
-        result: {
-          kind: "updated" as const,
-          text: `Updated expense ${formatExpense(expense)} in "${trip.title}": ${changes.join(", ")}.`,
-        },
-      };
+      await submit(ops);
+      return { changes, expense, tripTitle: trip.title };
     });
+    if ("response" in result && result.response) return result.response;
 
     return {
-      content: [{ type: "text", text: result.text }],
-      ...(result.kind === "error" ? { isError: true } : {}),
+      content: [
+        {
+          type: "text",
+          text: `Updated expense ${formatExpense(result.expense)} in "${result.tripTitle}": ${result.changes.join(", ")}.`,
+        },
+      ],
     };
   } catch (err) {
     const msg =

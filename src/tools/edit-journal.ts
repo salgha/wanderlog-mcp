@@ -4,7 +4,7 @@ import { WanderlogError, WanderlogNotFoundError, WanderlogValidationError } from
 import type { Json0Op } from "../ot/apply.js";
 import type { JournalStop } from "../types.js";
 import { findStopMatches, formatStop, formatStopCandidateList } from "./journal-shared.js";
-import { buildAndSubmitOp } from "./shared.js";
+import { submitOp } from "./shared.js";
 
 export const editJournalInputSchema = {
   trip_key: z.string().min(1).describe("The trip whose journal to edit."),
@@ -24,7 +24,9 @@ export const editJournalInputSchema = {
   new_text: z
     .string()
     .optional()
-    .describe("New journal entry text for the stop (replaces the existing text). Omit to leave unchanged."),
+    .describe(
+      "New journal entry text for the stop (replaces the existing text). Omit to leave unchanged.",
+    ),
   new_date: z
     .string()
     .regex(/^\d{4}-\d{2}-\d{2}$/, "must be YYYY-MM-DD")
@@ -66,7 +68,9 @@ type Args = {
 
 /** od+oi replacement for an existing key; oi-only insert when the key is absent. */
 function replaceField(path: (string | number)[], oldValue: unknown, newValue: unknown): Json0Op {
-  return oldValue === undefined ? { p: path, oi: newValue } : { p: path, od: oldValue, oi: newValue };
+  return oldValue === undefined
+    ? { p: path, oi: newValue }
+    : { p: path, od: oldValue, oi: newValue };
 }
 
 /** Rebuilds a stop's dateTime from new date/time parts, preserving the timezone offset. */
@@ -129,10 +133,8 @@ export async function editJournal(
       );
     }
 
-    const result = await buildAndSubmitOp<{
-      kind: "error" | "no-change" | "updated";
-      text: string;
-    }>(ctx, args.trip_key, (trip) => {
+    const result = await submitOp(ctx, args.trip_key, async (entry, submit) => {
+      const trip = entry.snapshot;
       const ops: Json0Op[] = [];
       const changes: string[] = [];
       let stopLabel = "";
@@ -149,10 +151,14 @@ export async function editJournal(
         }
         if (matches.length > 1) {
           return {
-            ops: [],
-            result: {
-              kind: "error" as const,
-              text: `"${args.title}" matches ${matches.length} journal stops:\n${formatStopCandidateList(matches)}\n\nRe-call with a more specific title, or add a date filter to pick one.`,
+            response: {
+              content: [
+                {
+                  type: "text" as const,
+                  text: `"${args.title}" matches ${matches.length} journal stops:\n${formatStopCandidateList(matches)}\n\nRe-call with a more specific title, or add a date filter to pick one.`,
+                },
+              ],
+              isError: true,
             },
           };
         }
@@ -173,26 +179,28 @@ export async function editJournal(
 
       if (ops.length === 0) {
         return {
-          ops,
-          result: {
-            kind: "no-change" as const,
-            text: `No changes — those values already match in "${trip.title}".`,
+          response: {
+            content: [
+              {
+                type: "text" as const,
+                text: `No changes — those values already match in "${trip.title}".`,
+              },
+            ],
           },
         };
       }
-      const target = stopLabel ? `stop ${stopLabel}` : "journal";
-      return {
-        ops,
-        result: {
-          kind: "updated" as const,
-          text: `Updated ${target} in "${trip.title}": ${changes.join(", ")}.`,
-        },
-      };
+      await submit(ops);
+      return { stopLabel, changes, tripTitle: trip.title };
     });
-
+    if ("response" in result && result.response) return result.response;
+    const target = result.stopLabel ? `stop ${result.stopLabel}` : "journal";
     return {
-      content: [{ type: "text", text: result.text }],
-      ...(result.kind === "error" ? { isError: true } : {}),
+      content: [
+        {
+          type: "text",
+          text: `Updated ${target} in "${result.tripTitle}": ${result.changes.join(", ")}.`,
+        },
+      ],
     };
   } catch (err) {
     const msg =

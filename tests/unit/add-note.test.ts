@@ -1,10 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { AppContext } from "../../src/context.ts";
-import type { Json0Op } from "../../src/ot/apply.ts";
-import {
-  addNote,
-  addNoteInputSchema,
-} from "../../src/tools/add-note.ts";
+import { applyOp, type Json0Op } from "../../src/ot/apply.ts";
+import { addNote, addNoteInputSchema } from "../../src/tools/add-note.ts";
 import type { TripPlan } from "../../src/types.ts";
 import { checklistTrip } from "../fixtures/checklist-trip.ts";
 
@@ -13,6 +10,7 @@ function makeFakeContext(trip: TripPlan): {
   submittedOps: Json0Op[][];
 } {
   const submittedOps: Json0Op[][] = [];
+  const entry = { snapshot: structuredClone(trip), version: 1, geos: [] };
   const ctx = {
     userId: 3656632,
     pool: {
@@ -25,8 +23,11 @@ function makeFakeContext(trip: TripPlan): {
       }),
     },
     tripCache: {
-      getEntry: async () => ({ snapshot: structuredClone(trip) }),
-      applyLocalOp: () => {},
+      getEntry: async () => entry,
+      applyLocalOp: (_key: string, ops: Json0Op[], version: number) => {
+        entry.snapshot = applyOp(entry.snapshot, ops);
+        entry.version = version;
+      },
       invalidate: () => {},
     },
   } as unknown as AppContext;
@@ -36,13 +37,13 @@ function makeFakeContext(trip: TripPlan): {
 describe("addNoteInputSchema", () => {
   const base = { trip_key: "T", text: "Remember the tickets" };
 
-  it("accepts zero or one target and rejects ambiguous dual targeting", () => {
+  it("accepts zero, one, or both targets", () => {
     expect(addNoteInputSchema.safeParse(base).success).toBe(true);
     expect(addNoteInputSchema.safeParse({ ...base, day: "day 1" }).success).toBe(true);
     expect(addNoteInputSchema.safeParse({ ...base, section: "Notes" }).success).toBe(true);
-    expect(
-      addNoteInputSchema.safeParse({ ...base, day: "day 1", section: "Notes" }).success,
-    ).toBe(false);
+    expect(addNoteInputSchema.safeParse({ ...base, day: "day 1", section: "Notes" }).success).toBe(
+      true,
+    );
   });
 
   it("rejects empty target strings", () => {
@@ -61,16 +62,10 @@ describe("addNote section targeting", () => {
 
     expect(result.isError).toBeUndefined();
     expect(result.content[0]!.text).toContain("places to visit");
-    expect(submittedOps[0]![0]!.p).toEqual([
-      "itinerary",
-      "sections",
-      1,
-      "blocks",
-      1,
-    ]);
+    expect(submittedOps[0]![0]!.p).toEqual(["itinerary", "sections", 1, "blocks", 1]);
   });
 
-  it("rejects day and section together without submitting operations", async () => {
+  it("lets section override day when both targets are provided", async () => {
     const { ctx, submittedOps } = makeFakeContext(checklistTrip);
     const result = await addNote(ctx, {
       trip_key: "T",
@@ -79,9 +74,9 @@ describe("addNote section targeting", () => {
       section: "Notes",
     });
 
-    expect(result.isError).toBe(true);
-    expect(result.content[0]!.text).toMatch(/either day or section/i);
-    expect(submittedOps).toHaveLength(0);
+    expect(result.isError).toBeUndefined();
+    expect(result.content[0]!.text).toContain('section "Notes"');
+    expect(submittedOps[0]![0]!.p).toEqual(["itinerary", "sections", 0, "blocks", 0]);
   });
 
   it("adds a note to a named undated section case-insensitively", async () => {
@@ -94,17 +89,10 @@ describe("addNote section targeting", () => {
 
     expect(result.isError).toBeUndefined();
     expect(result.content[0]!.text).toContain('section "Notes"');
-    expect(submittedOps).toHaveLength(1);
-    expect(submittedOps[0]).toHaveLength(2);
-    expect(submittedOps[0]![0]!.p).toEqual([
-      "itinerary",
-      "sections",
-      0,
-      "blocks",
-      0,
-    ]);
+    expect(submittedOps).toHaveLength(2);
+    expect(submittedOps[0]![0]!.p).toEqual(["itinerary", "sections", 0, "blocks", 0]);
     expect((submittedOps[0]![0] as { li: { type: string } }).li.type).toBe("note");
-    expect(submittedOps[0]![1]).toMatchObject({
+    expect(submittedOps[1]![0]).toMatchObject({
       p: ["itinerary", "sections", 0, "blocks", 0, "text"],
       t: "rich-text",
       o: [{ insert: "Keep passport copies here\n" }],
@@ -121,13 +109,7 @@ describe("addNote section targeting", () => {
 
     expect(result.isError).toBeUndefined();
     expect(result.content[0]!.text).toContain('section "Places to visit"');
-    expect(submittedOps[0]![0]!.p).toEqual([
-      "itinerary",
-      "sections",
-      1,
-      "blocks",
-      1,
-    ]);
+    expect(submittedOps[0]![0]!.p).toEqual(["itinerary", "sections", 1, "blocks", 1]);
   });
 
   it("rejects an unknown section without submitting operations", async () => {
@@ -155,13 +137,7 @@ describe("addNote section targeting", () => {
 
     expect(result.isError).toBeUndefined();
     expect(result.content[0]!.text).toContain('section "Notes"');
-    expect(submittedOps[0]![0]!.p).toEqual([
-      "itinerary",
-      "sections",
-      0,
-      "blocks",
-      0,
-    ]);
+    expect(submittedOps[0]![0]!.p).toEqual(["itinerary", "sections", 0, "blocks", 0]);
   });
 
   it("rejects a dayPlan section even when it has no date", async () => {
@@ -175,8 +151,8 @@ describe("addNote section targeting", () => {
     });
 
     expect(result.isError).toBe(true);
-    expect(result.content[0]!.text).toMatch(/points to a trip day/i);
-    expect(result.content[0]!.text).toMatch(/day parameter/i);
+    expect(result.content[0]!.text).toContain("is a dated section");
+    expect(result.content[0]!.text).toContain('"day" parameter');
     expect(submittedOps).toHaveLength(0);
   });
 
@@ -190,12 +166,6 @@ describe("addNote section targeting", () => {
 
     expect(result.isError).toBeUndefined();
     expect(result.content[0]!.text).toContain("day 2026-06-01");
-    expect(submittedOps[0]![0]!.p).toEqual([
-      "itinerary",
-      "sections",
-      2,
-      "blocks",
-      3,
-    ]);
+    expect(submittedOps[0]![0]!.p).toEqual(["itinerary", "sections", 2, "blocks", 3]);
   });
 });

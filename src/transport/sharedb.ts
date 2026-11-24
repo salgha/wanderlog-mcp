@@ -42,10 +42,6 @@ type OpFrame = {
 
 type Frame = InitFrame | HandshakeAckFrame | SubscribeAckFrame | OpFrame;
 
-export type SubmitOutcome = {
-  remoteOpObserved: boolean;
-};
-
 export interface ShareDBClient {
   /** Fired when a remote op (not one we submitted) is received. */
   on(event: "remoteOp", listener: (ops: Json0Op[], version: number) => void): this;
@@ -69,7 +65,6 @@ export class ShareDBClient extends EventEmitter {
   private seqCounter = 0;
   private snapshot?: TripPlan;
   private _version = 0;
-  private _remoteOpGeneration = 0;
   private subscribed = false;
   private subscribePending?: {
     resolve: (ack: SubscribeAckFrame) => void;
@@ -77,12 +72,7 @@ export class ShareDBClient extends EventEmitter {
   };
   private readonly pendingOps = new Map<
     number,
-    {
-      resolve: (outcome: SubmitOutcome) => void;
-      reject: (err: Error) => void;
-      timer: NodeJS.Timeout;
-      remoteOpObserved: boolean;
-    }
+    { resolve: () => void; reject: (err: Error) => void; timer: NodeJS.Timeout }
   >();
   private connectPromise?: Promise<void>;
   private reconnectTimer?: NodeJS.Timeout;
@@ -96,10 +86,6 @@ export class ShareDBClient extends EventEmitter {
 
   get version(): number {
     return this._version;
-  }
-
-  get remoteOpGeneration(): number {
-    return this._remoteOpGeneration;
   }
 
   get currentSnapshot(): TripPlan | undefined {
@@ -165,9 +151,7 @@ export class ShareDBClient extends EventEmitter {
         const wasSubscribed = this.subscribed;
         this.handshakeComplete = false;
         this.subscribed = false;
-        this.failAllPending(
-          new WanderlogError("WebSocket closed", "ws_closed"),
-        );
+        this.failAllPending(new WanderlogError("WebSocket closed", "ws_closed"));
         this.emit("closed", code);
         if (!this.closedByUser && code !== 1000) {
           this.scheduleReconnect(wasSubscribed);
@@ -180,10 +164,7 @@ export class ShareDBClient extends EventEmitter {
           reject(new WanderlogAuthError());
         } else {
           reject(
-            new WanderlogError(
-              `WebSocket upgrade failed: ${res.statusCode}`,
-              "ws_upgrade_failed",
-            ),
+            new WanderlogError(`WebSocket upgrade failed: ${res.statusCode}`, "ws_upgrade_failed"),
           );
         }
       });
@@ -218,7 +199,7 @@ export class ShareDBClient extends EventEmitter {
 
     if (frame.error) {
       const err = frame.error as string | { message?: string };
-      const errMsg = typeof err === "string" ? err : err.message ?? "unknown";
+      const errMsg = typeof err === "string" ? err : (err.message ?? "unknown");
 
       // If the error frame carries a seq, it belongs to a specific submit.
       // Fail only that one pending op, so concurrent/queued submits are not
@@ -227,7 +208,7 @@ export class ShareDBClient extends EventEmitter {
         const pending = this.pendingOps.get(frame.seq)!;
         this.pendingOps.delete(frame.seq);
         clearTimeout(pending.timer);
-        pending.reject(new WanderlogError(errMsg, "ws_error"));
+        pending.reject(new WanderlogError(errMsg, "ws_op_rejected"));
         return;
       }
 
@@ -268,24 +249,18 @@ export class ShareDBClient extends EventEmitter {
 
   private handleOpFrame(frame: OpFrame): void {
     const isOurAck =
-      frame.src === this.sessionId &&
-      frame.seq !== undefined &&
-      this.pendingOps.has(frame.seq);
+      frame.src === this.sessionId && frame.seq !== undefined && this.pendingOps.has(frame.seq);
 
     if (isOurAck) {
       const pending = this.pendingOps.get(frame.seq!)!;
       this.pendingOps.delete(frame.seq!);
       clearTimeout(pending.timer);
       this._version = frame.v + 1;
-      pending.resolve({ remoteOpObserved: pending.remoteOpObserved });
+      pending.resolve();
       return;
     }
 
     if (frame.op && frame.op.length > 0) {
-      for (const pending of this.pendingOps.values()) {
-        pending.remoteOpObserved = true;
-      }
-      this._remoteOpGeneration += 1;
       this._version = frame.v + 1;
       this.emit("remoteOp", frame.op, this._version);
     }
@@ -342,10 +317,7 @@ export class ShareDBClient extends EventEmitter {
 
   private send(obj: unknown): void {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
-      throw new WanderlogError(
-        "WebSocket is not open — cannot send frame",
-        "ws_not_open",
-      );
+      throw new WanderlogError("WebSocket is not open — cannot send frame", "ws_not_open");
     }
     this.ws.send(JSON.stringify(obj));
   }
@@ -382,12 +354,9 @@ export class ShareDBClient extends EventEmitter {
    *
    * On successful ack, the local version is bumped to `frame.v + 1`.
    */
-  async submit(ops: Json0Op[]): Promise<SubmitOutcome> {
+  async submit(ops: Json0Op[]): Promise<void> {
     if (!this.subscribed) {
-      throw new WanderlogError(
-        "Cannot submit op before subscribing to the trip",
-        "not_subscribed",
-      );
+      throw new WanderlogError("Cannot submit op before subscribing to the trip", "not_subscribed");
     }
     if (ops.length === 0) {
       throw new WanderlogError("Cannot submit an empty op array", "empty_op");
@@ -405,19 +374,14 @@ export class ShareDBClient extends EventEmitter {
       op: ops,
     };
 
-    return new Promise<SubmitOutcome>((resolve, reject) => {
+    return new Promise<void>((resolve, reject) => {
       const timer = setTimeout(() => {
         if (this.pendingOps.has(seq)) {
           this.pendingOps.delete(seq);
           reject(new WanderlogError("Submit op timeout", "submit_timeout"));
         }
       }, 10_000);
-      this.pendingOps.set(seq, {
-        resolve,
-        reject,
-        timer,
-        remoteOpObserved: false,
-      });
+      this.pendingOps.set(seq, { resolve, reject, timer });
       try {
         this.send(frame);
       } catch (err) {
@@ -466,11 +430,13 @@ export class ShareDBPool {
     return this.clients.has(tripKey);
   }
 
-  discard(tripKey: string): void {
+  evict(tripKey: string, expectedClient?: ShareDBClient): boolean {
     const client = this.clients.get(tripKey);
-    if (!client) return;
+    if (!client || (expectedClient && client !== expectedClient)) return false;
+
     this.clients.delete(tripKey);
     client.close();
+    return true;
   }
 
   closeAll(): void {

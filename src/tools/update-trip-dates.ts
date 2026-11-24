@@ -3,12 +3,7 @@ import type { AppContext } from "../context.js";
 import { WanderlogError, WanderlogValidationError } from "../errors.js";
 import type { Json0Op } from "../ot/apply.js";
 import type { Section, TripPlan } from "../types.js";
-import {
-  buildAndSubmitOp,
-  generateBlockId,
-  isValidDate,
-  validateDateRange,
-} from "./shared.js";
+import { generateBlockId, submitOp, isValidDate, validateDateRange } from "./shared.js";
 
 export const updateTripDatesInputSchema = {
   trip_key: z.string().min(1).describe("The trip to update."),
@@ -99,10 +94,7 @@ export function buildEmptyDaySection(date: string): Section {
  * should be inserted to keep the day sections in ascending date order.
  * Returns `sections.length` if it belongs at the end.
  */
-export function findDayInsertIndex(
-  sections: readonly Section[],
-  newDate: string,
-): number {
+export function findDayInsertIndex(sections: readonly Section[], newDate: string): number {
   for (let i = 0; i < sections.length; i++) {
     const s = sections[i]!;
     if (s.mode === "dayPlan" && s.date && s.date > newDate) {
@@ -117,16 +109,9 @@ export type DayDiff = {
   toRemove: Array<{ date: string; index: number; section: Section }>;
 };
 
-export function diffDays(
-  trip: TripPlan,
-  newStart: string,
-  newEnd: string,
-): DayDiff {
+export function diffDays(trip: TripPlan, newStart: string, newEnd: string): DayDiff {
   const targetDates = new Set(enumerateDates(newStart, newEnd));
-  const currentByDate = new Map<
-    string,
-    { index: number; section: Section }
-  >();
+  const currentByDate = new Map<string, { index: number; section: Section }>();
 
   trip.itinerary.sections.forEach((section, index) => {
     if (section.mode === "dayPlan" && section.date) {
@@ -173,9 +158,7 @@ export function buildUpdateDatesOps(
 
   // Safety: check for destructive removes
   if (!force) {
-    const nonEmpty = diff.toRemove.filter(
-      (r) => r.section.blocks && r.section.blocks.length > 0,
-    );
+    const nonEmpty = diff.toRemove.filter((r) => r.section.blocks && r.section.blocks.length > 0);
     if (nonEmpty.length > 0) {
       const lines = nonEmpty
         .sort((a, b) => a.date.localeCompare(b.date))
@@ -208,9 +191,7 @@ export function buildUpdateDatesOps(
   // 2. Insertions — compute positions against the post-deletion state.
   //    Simulate the array locally so multi-insert cases get correct indices.
   const removedSet = new Set(diff.toRemove.map((r) => r.section));
-  const simulated: Section[] = trip.itinerary.sections.filter(
-    (s) => !removedSet.has(s),
-  );
+  const simulated: Section[] = trip.itinerary.sections.filter((s) => !removedSet.has(s));
 
   for (const date of diff.toAdd) {
     const newSection = buildEmptyDaySection(date);
@@ -265,35 +246,33 @@ export async function updateTripDates(
       );
     }
     validateDateRange(args.start_date, args.end_date);
-    const result = await buildAndSubmitOp(ctx, args.trip_key, (trip) => {
-      const ops = buildUpdateDatesOps(
-        trip,
-        args.start_date,
-        args.end_date,
-        args.force ?? false,
-      );
-      return {
-        ops,
-        result: {
-          changed: ops.length > 0,
-          diff: diffDays(trip, args.start_date, args.end_date),
-          title: trip.title,
-        },
-      };
-    });
-
-    if (!result.changed) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `"${result.title}" already has dates ${args.start_date} → ${args.end_date}. No changes made.`,
+    const result = await submitOp(ctx, args.trip_key, async (entry, submit) => {
+      const trip = entry.snapshot;
+      const ops = buildUpdateDatesOps(trip, args.start_date, args.end_date, args.force ?? false);
+      if (ops.length === 0) {
+        return {
+          response: {
+            content: [
+              {
+                type: "text" as const,
+                text: `"${trip.title}" already has dates ${args.start_date} → ${args.end_date}. No changes made.`,
+              },
+            ],
           },
-        ],
-      };
-    }
-
-    const summary: string[] = [`Updated "${result.title}" to ${args.start_date} → ${args.end_date}.`];
+        };
+      }
+      const diff = diffDays(trip, args.start_date, args.end_date);
+      const removedSectionIds = new Set(diff.toRemove.map(({ section }) => section.id));
+      await submit(ops);
+      if (entry.snapshot.itinerary.sections.some((section) => removedSectionIds.has(section.id))) {
+        throw new WanderlogError("A removed day section is still present", "stale_target");
+      }
+      return { diff, tripTitle: trip.title };
+    });
+    if ("response" in result && result.response) return result.response;
+    const summary: string[] = [
+      `Updated "${result.tripTitle}" to ${args.start_date} → ${args.end_date}.`,
+    ];
     if (result.diff.toAdd.length > 0) {
       summary.push(`  Added ${result.diff.toAdd.length} day(s): ${result.diff.toAdd.join(", ")}`);
     }

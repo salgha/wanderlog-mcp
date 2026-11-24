@@ -3,7 +3,7 @@ import type { AppContext } from "../../src/context.ts";
 import { WanderlogError } from "../../src/errors.ts";
 import type { Json0Op } from "../../src/ot/apply.ts";
 import { submitOp } from "../../src/tools/shared.ts";
-import { ShareDBClient, type SubmitOutcome } from "../../src/transport/sharedb.ts";
+import { ShareDBClient } from "../../src/transport/sharedb.ts";
 
 const ops: Json0Op[] = [{ p: ["days"], od: 3, oi: 5 }];
 
@@ -20,17 +20,22 @@ function makeFakeContext(failures: Array<Error | null>): {
   const fakeClient = {
     isSubscribed: true,
     version: 0,
-    remoteOpGeneration: 0,
     async submit(_ops: Json0Op[]): Promise<void> {
       const failure = failures[callIndex++];
       if (failure) throw failure;
       this.version += 1;
     },
   };
+  const entry = {
+    snapshot: {} as never,
+    version: 0,
+    geos: [],
+  };
 
   const ctx = {
     pool: { get: () => fakeClient },
     tripCache: {
+      getEntry: async () => entry,
       applyLocalOp: () => {
         applyLocalOpCount++;
       },
@@ -49,10 +54,7 @@ function makeFakeContext(failures: Array<Error | null>): {
 }
 
 const rateLimitError = () =>
-  new WanderlogError(
-    "Wanderlog rejected the request (4001): Too many requests",
-    "rate_limited",
-  );
+  new WanderlogError("Wanderlog rejected the request (4001): Too many requests", "rate_limited");
 
 describe("submitOp rate-limit retry", () => {
   beforeEach(() => {
@@ -64,7 +66,7 @@ describe("submitOp rate-limit retry", () => {
 
   it("retries after a rate_limited error and succeeds", async () => {
     const fake = makeFakeContext([rateLimitError(), null]);
-    const promise = submitOp(fake.ctx, "tripA", ops);
+    const promise = submitOp(fake.ctx, "tripA", (_entry, submit) => submit(ops));
     await vi.advanceTimersByTimeAsync(2_000);
     await promise;
     expect(fake.submitCalls()).toBe(2);
@@ -72,97 +74,14 @@ describe("submitOp rate-limit retry", () => {
     expect(fake.invalidateCount()).toBe(0);
   });
 
-  it("does not retry when a remote op arrives before the rate-limit rejection", async () => {
-    let rejectFirstSubmit!: (error: Error) => void;
-    let submitCalls = 0;
-    let invalidateCount = 0;
-    let applyLocalOpCount = 0;
-    const client = {
-      isSubscribed: true,
-      version: 7,
-      remoteOpGeneration: 0,
-      submit: () => {
-        submitCalls += 1;
-        if (submitCalls > 1) {
-          return Promise.reject(
-            new WanderlogError("stale operation was retried", "stale_op_retried"),
-          );
-        }
-        return new Promise<void>((_resolve, reject) => {
-          rejectFirstSubmit = reject;
-        });
-      },
-    };
-    const ctx = {
-      pool: { get: () => client },
-      tripCache: {
-        applyLocalOp: () => {
-          applyLocalOpCount += 1;
-        },
-        invalidate: () => {
-          invalidateCount += 1;
-        },
-      },
-    } as unknown as AppContext;
-
-    const pending = submitOp(ctx, "tripA", ops);
-    const result = pending.catch((error: unknown) => error);
-    await Promise.resolve();
-    client.remoteOpGeneration += 1;
-    rejectFirstSubmit(rateLimitError());
-    await vi.advanceTimersByTimeAsync(2_000);
-
-    await expect(result).resolves.toMatchObject({ code: "stale_rate_limit_retry" });
-    expect(submitCalls).toBe(1);
-    expect(invalidateCount).toBe(1);
-    expect(applyLocalOpCount).toBe(0);
-  });
-
-  it("does not retry when a remote op arrives during rate-limit backoff", async () => {
-    let submitCalls = 0;
-    let invalidateCount = 0;
-    const client = {
-      isSubscribed: true,
-      version: 7,
-      remoteOpGeneration: 0,
-      async submit(): Promise<void> {
-        submitCalls += 1;
-        if (submitCalls === 1) throw rateLimitError();
-        throw new WanderlogError("stale operation was retried", "stale_op_retried");
-      },
-    };
-    const ctx = {
-      pool: { get: () => client },
-      tripCache: {
-        applyLocalOp: () => {
-          throw new Error("stale op must not be applied");
-        },
-        invalidate: () => {
-          invalidateCount += 1;
-        },
-      },
-    } as unknown as AppContext;
-
-    const pending = submitOp(ctx, "tripA", ops);
-    const result = pending.catch((error: unknown) => error);
-    await vi.advanceTimersByTimeAsync(0);
-    expect(vi.getTimerCount()).toBe(1);
-    client.remoteOpGeneration += 1;
-    await vi.advanceTimersByTimeAsync(2_000);
-
-    await expect(result).resolves.toMatchObject({ code: "stale_rate_limit_retry" });
-    expect(submitCalls).toBe(1);
-    expect(invalidateCount).toBe(1);
-  });
-
-  it("gives up after exhausting retries and invalidates the cache", async () => {
+  it("gives up after exhausting retries without invalidating the cache", async () => {
     const fake = makeFakeContext([
       rateLimitError(),
       rateLimitError(),
       rateLimitError(),
       rateLimitError(),
     ]);
-    const promise = submitOp(fake.ctx, "tripA", ops);
+    const promise = submitOp(fake.ctx, "tripA", (_entry, submit) => submit(ops));
     const assertion = expect(promise).rejects.toMatchObject({
       code: "rate_limited",
     });
@@ -170,14 +89,26 @@ describe("submitOp rate-limit retry", () => {
     await assertion;
     expect(fake.submitCalls()).toBe(4);
     expect(fake.applyLocalOpCount()).toBe(0);
-    expect(fake.invalidateCount()).toBe(1);
+    expect(fake.invalidateCount()).toBe(0);
   });
 
-  it("does not retry non-rate-limit errors", async () => {
-    const fake = makeFakeContext([
-      new WanderlogError("Submit op timeout", "submit_timeout"),
-    ]);
-    await expect(submitOp(fake.ctx, "tripA", ops)).rejects.toMatchObject({
+  it.each(["empty_op", "ws_not_open", "ws_op_rejected"])(
+    "preserves the cache after confirmed non-application error %s",
+    async (code) => {
+      const fake = makeFakeContext([new WanderlogError("rejected", code)]);
+      await expect(
+        submitOp(fake.ctx, "tripA", (_entry, submit) => submit(ops)),
+      ).rejects.toMatchObject({ code });
+      expect(fake.submitCalls()).toBe(1);
+      expect(fake.invalidateCount()).toBe(0);
+    },
+  );
+
+  it("invalidates after an ambiguous non-rate-limit error", async () => {
+    const fake = makeFakeContext([new WanderlogError("Submit op timeout", "submit_timeout")]);
+    await expect(
+      submitOp(fake.ctx, "tripA", (_entry, submit) => submit(ops)),
+    ).rejects.toMatchObject({
       code: "submit_timeout",
     });
     expect(fake.submitCalls()).toBe(1);
@@ -195,18 +126,13 @@ describe("ShareDBClient bare {code, message} rejection frames", () => {
 
   function clientWithPendingOp(): {
     client: ShareDBClient;
-    pending: Promise<SubmitOutcome>;
+    pending: Promise<void>;
   } {
     const client = new ShareDBClient(config, "tripA");
     const internals = client as unknown as {
       pendingOps: Map<
         number,
-        {
-          resolve: (outcome: SubmitOutcome) => void;
-          reject: (err: Error) => void;
-          timer: NodeJS.Timeout;
-          remoteOpObserved: boolean;
-        }
+        { resolve: () => void; reject: (err: Error) => void; timer: NodeJS.Timeout }
       >;
       handleFrame: (
         frame: Record<string, unknown>,
@@ -214,12 +140,11 @@ describe("ShareDBClient bare {code, message} rejection frames", () => {
         connectResolve: () => void,
       ) => void;
     };
-    const pending = new Promise<SubmitOutcome>((resolve, reject) => {
+    const pending = new Promise<void>((resolve, reject) => {
       internals.pendingOps.set(1, {
         resolve,
         reject,
         timer: setTimeout(() => {}, 60_000),
-        remoteOpObserved: false,
       });
     });
     return { client, pending };
@@ -234,7 +159,11 @@ describe("ShareDBClient bare {code, message} rejection frames", () => {
           connectResolve: () => void,
         ) => void;
       }
-    ).handleFrame(frame, setTimeout(() => {}, 60_000), () => {});
+    ).handleFrame(
+      frame,
+      setTimeout(() => {}, 60_000),
+      () => {},
+    );
   }
 
   it("maps code 4001 to a rate_limited error on pending ops", async () => {
@@ -252,6 +181,18 @@ describe("ShareDBClient bare {code, message} rejection frames", () => {
     await expect(pending).rejects.toMatchObject({ code: "ws_rejected" });
   });
 
+  it("maps a targeted op error to ws_op_rejected", async () => {
+    const { client, pending } = clientWithPendingOp();
+    deliverFrame(client, { error: "bad path", seq: 1 });
+    await expect(pending).rejects.toMatchObject({ code: "ws_op_rejected" });
+  });
+
+  it("keeps an unscoped op error ambiguous", async () => {
+    const { client, pending } = clientWithPendingOp();
+    deliverFrame(client, { error: "unknown failure" });
+    await expect(pending).rejects.toMatchObject({ code: "ws_error" });
+  });
+
   it("does not treat op acks (which carry `a`) as rejections", async () => {
     const { client, pending } = clientWithPendingOp();
     const internals = client as unknown as { sessionId?: string };
@@ -264,7 +205,7 @@ describe("ShareDBClient bare {code, message} rejection frames", () => {
       c: "TripPlans",
       d: "tripA",
     });
-    await expect(pending).resolves.toEqual({ remoteOpObserved: false });
+    await expect(pending).resolves.toBeUndefined();
     expect(client.version).toBe(8);
   });
 });
